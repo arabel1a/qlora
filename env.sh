@@ -18,21 +18,21 @@ export HCCL_IF_BASE_PORT=48000
 # export SERVED_MODEL_NAME_LORA="lora-adapter"
 # export MAX_NUM_SEQ=64
 export MODEL_TAG="Qwen3-4B-Instruct-2507"
-export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4B-Instruct-2507-LoRA"
+export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
 export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
 export MAX_LORAS=20 # IMPORTANT! number of loras per batch can not exceed the number of AI cubes
 export MAX_LORA_RANK=32
 
 # benchmarks
 : "${NUM_PROMPTS:=512}"
-: "${RANDOM_INPUT_LEN:=1024}"
+: "${RANDOM_INPUT_LEN:=2048}"
 : "${RANDOM_OUTPUT_LEN:=512}"
 # export DATASET="random"
 # export DATASET=./custom_dataset_qwen3_2000.jsonl
 : "${DATASET:=random}"
-export DATASET=/home/russia_mmo/vllm_ascend_hub/vllm_repos/scripts/generated/custom_dataset_qwen3_2000.jsonl
-# export MODEL_PREPARE_TIMEOUT_S=300
-# export PROCESS_KILL_TIMEOUT_S=30
+# export DATASET=/home/russia_mmo/vllm_ascend_hub/vllm_repos/scripts/generated/custom_dataset_qwen3_2000.jsonl
+export START_TIMEOUT=300
+export STOP_TIMEOUT=30
 
 
 # vllm
@@ -40,10 +40,11 @@ export TENSOR_PARALLEL_SIZE=1
 export DATA_PARALLEL_SIZE=1
 export MAX_NUM_SEQ=1024
 export MAX_MODEL_LEN=4096
-export MAX_NUM_BATCHED_TOKENS=32768
-export MEMORY_UTILIZATION=0.9
+export MAX_NUM_BATCHED_TOKENS=65535
+export MEMORY_UTILIZATION=0.95
 export DTYPE="bfloat16"
 export BLOCK_SIZE=128
+
 COMMON_VLLM_ARGS=(
     "$MODEL"
     --dtype "$DTYPE"
@@ -68,16 +69,20 @@ LORA_ARGS=(
 
 throughput_bench() {
     vllm bench throughput \
-	    --backend vllm \
-	    --model "${COMMON_VLLM_ARGS[@]}" \
+	--backend vllm \
+	--model "${COMMON_VLLM_ARGS[@]}" \
         --num-prompts "$NUM_PROMPTS" \
         --dataset-name "$DATASET" \
         --random-input-len "$RANDOM_INPUT_LEN" \
         --random-output-len "$RANDOM_OUTPUT_LEN" \
         --seed 0 \
-	    --disable-detokenize \
-	    --disable-frontend-multiprocessing \
-	    "$@"
+	--disable-detokenize \
+	--disable-frontend-multiprocessing \
+        --enable-lora \
+        --max-loras $MAX_LORAS \
+        --max-lora-rank $MAX_LORA_RANK \
+        --lora-path ${LORA_ADAPTER} \
+	"$@"
 }
 
 run_lora_server() {
@@ -110,14 +115,14 @@ send_request() {
     local STRING=$2
     [ -n "$label" ] && echo "--> Testing: $label"
     
-    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 100,\"temperature\": 1.0}"
+    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 100,\"temperature\": 0.0}"
 }
 
 run_evalscope() {
     local model_name=$1
     local label=$2
     echo "Running Eval: [$label] with model: $model_name"
-    export DATASET=/home/russia_mmo/vllm_ascend_hub/vllm_repos/scripts/generated/custom_dataset_qwen3_2000.jsonl
+    export DATASET=random.jsonl
     export URL=http://0.0.0.0:${PORT}/v1/chat/completions
     python run_evalscope.py \
         --number "$NUM_PROMPTS" \
@@ -131,8 +136,17 @@ run_evalscope() {
         --min-tokens 512 \
         --prefix-length 0 \
         --extra-args '{"ignore_eos": true}' \
-        --outputs-dir "logs/${EXPERIMENT}" \
+        --outputs-dir "logs/${label}" \
         --rate -1
+}
+
+benchmark() {
+	run_name=$1
+	bash -c "run_lora_server" &
+	sleep $START_TIMEOUT
+	bash -c "run_evalscope $lora-adapter $run_name" | tee > $run_name
+ 	cleanup_vllm	
+	sleep $STOP_TIMEOUT
 }
 
 cleanup_vllm() {

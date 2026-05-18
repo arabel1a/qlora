@@ -1,12 +1,17 @@
 from typing import List
 import torch
 import torch_npu
-from .common import _get_lora_a_ptr, NUM_AI_CORES
 # from .common import NUM_AI_CORES
 import triton
 import triton.language as tl
 
 import os
+_LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
+NUM_AI_CORES=20
+
+import torch._dynamo
+torch._dynamo.config.verbose = True
+torch._dynamo.config.log_file_name = "/tmp/dynamo.log"
 
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
@@ -231,6 +236,7 @@ def _lora_shrink_kernel(
 
 # @torch.inference_mode()
 # @torch.no_grad()
+known_signatures = set()
 @torch.library.custom_op("misha::_shrink", mutates_args=("output_tensor",))
 def _shrink_op(
     inputs: torch.Tensor, # M x K
@@ -286,6 +292,20 @@ def _shrink_op(
     K_NUM_BLOCKS = triton.cdiv(K, BLOCK_K)
     grid = lambda meta: (NUM_AI_CORES,)
 
+    constexprs = (NUM_GROUPS, # at most 20 -> not that much of compilation burden
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        NUM_SLICES,
+        N_NUM_BLOCKS,
+        MAX_TILES_PER_CORE, # powers of 2 -> not that much
+        K_NUM_BLOCKS,
+        NUM_AI_CORES,
+        TRITON_DTYPE,
+        output_tensor.dtype != torch.float32,
+    )
+    if constexprs not in known_signatures:
+        known_signatures.add(constexprs)
+        print(constexprs)
+ 
     # output_tensor.zero_()
     _lora_shrink_kernel[grid](
         inputs, lora_ptr_tensor, output_tensor,
@@ -303,6 +323,7 @@ def _shrink_op(
         TRITON_DTYPE,
         output_tensor.dtype != torch.float32,
     )
+
 
 @_shrink_op.register_fake
 def _shrink_fake(
@@ -349,7 +370,7 @@ def _shrink_fake(
     
     return None
 
-shrink = torch.ops.misha._shrink.default
+triton_shrink = torch.ops.misha._shrink.default
 
 
 print ("hui " * 10)
@@ -365,7 +386,6 @@ SPLIT_PREFILL_DECODE=os.environ.get("VLLM_LORA_SPLIT_PREFILL_DECODE")
 if sum([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL]) > 1:
     raise ValueError("Choose one kernel, man.")
     
-from torch.compiler import disable
 import torch._dynamo
 from collections.abc import Callable
 import torch
@@ -374,15 +394,15 @@ from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 PATCHED_KERNEL = True # any([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL])
-if PATCHED_KERNEL:
-    import sys
-    sys.path.insert(0, '/home/russia_mmo/misha/kernels_profiling')
-    from baselines import torch_shrink, sgmv_shrink, sort_metadata, stub_shrink
-    from triton_lora import shrink as triton_shrink
-    print("\n" * 10)
-    print(f"WARNING: Misha patched lora kernels {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
-    print("\n" * 10)
-
+# if PATCHED_KERNEL:
+#     import sys
+#     sys.path.insert(0, '/home/russia_mmo/misha/kernels_profiling')
+#     from baselines import torch_shrink, sgmv_shrink, sort_metadata, stub_shrink
+#     from triton_lora import shrink as triton_shrink
+#     print("\n" * 10)
+#     print(f"WARNING: Misha patched lora kernels {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
+#     print("\n" * 10)
+# 
 # The platforms that are compatible with the PyTorch-native implementation can
 # inherit this class
 class PunicaWrapperNPU(PunicaWrapperBase):
