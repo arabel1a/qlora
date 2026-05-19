@@ -1,7 +1,7 @@
 # set -e
 # vllm
 : "${PORT:=1606}"
-: "${DEVICES:=6}"
+: "${DEVICES:=0,1,2,3}"
 export HOST=0.0.0.0
 
 # vllm magic
@@ -17,14 +17,16 @@ export HCCL_IF_BASE_PORT=48000
 # export SERVED_MODEL_NAME="qwen3"
 # export SERVED_MODEL_NAME_LORA="lora-adapter"
 # export MAX_NUM_SEQ=64
-export MODEL_TAG="Qwen3-4B-Instruct-2507"
-export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
+#export MODEL_TAG="Qwen3-4B-Instruct-2507"
+export MODEL_TAG="Qwen3-32B"
+#export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
+export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-32B-lora"
 export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
 export MAX_LORAS=20 # IMPORTANT! number of loras per batch can not exceed the number of AI cubes
 export MAX_LORA_RANK=32
 
 # benchmarks
-: "${NUM_PROMPTS:=512}"
+: "${NUM_PROMPTS:=256}"
 : "${RANDOM_INPUT_LEN:=2048}"
 : "${RANDOM_OUTPUT_LEN:=512}"
 # export DATASET="random"
@@ -36,11 +38,11 @@ export STOP_TIMEOUT=30
 
 
 # vllm
-export TENSOR_PARALLEL_SIZE=1
+export TENSOR_PARALLEL_SIZE=4
 export DATA_PARALLEL_SIZE=1
-export MAX_NUM_SEQ=1024
-export MAX_MODEL_LEN=4096
-export MAX_NUM_BATCHED_TOKENS=65535
+export MAX_NUM_SEQ=32
+export MAX_MODEL_LEN=32768
+export MAX_NUM_BATCHED_TOKENS=32768
 export MEMORY_UTILIZATION=0.95
 export DTYPE="bfloat16"
 export BLOCK_SIZE=128

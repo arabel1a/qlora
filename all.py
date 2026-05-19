@@ -9,9 +9,6 @@ import os
 _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 NUM_AI_CORES=20
 
-import torch._dynamo
-torch._dynamo.config.verbose = True
-torch._dynamo.config.log_file_name = "/tmp/dynamo.log"
 
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
@@ -394,14 +391,15 @@ from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 PATCHED_KERNEL = True # any([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL])
-# if PATCHED_KERNEL:
+if PATCHED_KERNEL:
+    print("\n" * 10)
+    print(f"WARNING: Misha patched lora kernels {USE_STUB_KERNEL=} {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
+    print("\n" * 10)
 #     import sys
 #     sys.path.insert(0, '/home/russia_mmo/misha/kernels_profiling')
 #     from baselines import torch_shrink, sgmv_shrink, sort_metadata, stub_shrink
 #     from triton_lora import shrink as triton_shrink
-#     print("\n" * 10)
-#     print(f"WARNING: Misha patched lora kernels {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
-#     print("\n" * 10)
+#     
 # 
 # The platforms that are compatible with the PyTorch-native implementation can
 # inherit this class
@@ -594,26 +592,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
         x = x.view(-1, x.shape[-1])
-        _prefill_flag = self.is_prefill
-        if SPLIT_PREFILL_DECODE:
-            if x.shape[0] > 1024:
-                self.is_prefill = True
-            else:
-                self.is_prefill = False
-             
-        for slice_idx in range(len(lora_a_stacked)):
-            if self.is_prefill:
-                if USE_STUB_KERNEL:
-                    pass
-                elif USE_TORCH_KERNEL:
-                    self.torch_shrink(x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0), *self.prefill_metadata, scale)
-                elif USE_TRITON_KERNEL:
-                    self.triton_shrink(x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0), *self.prefill_metadata, scale)
-                else:
-                    self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
-            else:
+        if USE_TRITON_KERNEL and self.is_prefill:
+            torch.ops.misha._shrink.default(
+                x, list(lora_a_stacked),
+                torch.stack(list(y)),
+                *self.prefill_metadata, scale,
+            )
+        else:
+            for slice_idx in range(len(lora_a_stacked)):
                 self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
-        self.is_prefill = _prefill_flag
 
     def add_expand(
         self,
