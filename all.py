@@ -235,6 +235,7 @@ def _lora_shrink_kernel(
 # @torch.inference_mode()
 # @torch.no_grad()
 known_signatures = set()
+print_cint = 0
 @torch.library.custom_op("misha::_shrink", mutates_args=("output_tensor",))
 def _shrink_op(
     inputs: torch.Tensor, # M x K
@@ -248,8 +249,8 @@ def _shrink_op(
     token_nums: int,  # total tokens
     scaling: float,
 ) -> None:
-    # torch._check(NUM_GROUPS <= NUM_AI_CORES)
-    # assert NUM_GROUPS <= NUM_AI_CORES
+    # assert NUM_GROUPS <= NUM_AI_CORES, f"{NUM_GROUPS}"
+    NUM_GROUPS = 1
     # assert inputs.dtype == lora_a_weights[0].dtype
     # assert inputs.dtype in [torch.float16, torch.bfloat16]
     TRITON_DTYPE = tl.float16 if inputs.dtype == torch.float16 else tl.bfloat16
@@ -276,7 +277,6 @@ def _shrink_op(
     lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2 = (
         _get_lora_a_ptr(lora_a_weights, inputs.device)
     )
-    # lora_ptr_tensor = None
     # assert (lora_strides_d0, lora_strides_d1, lora_strides_d2) == (K * N, K, 1)
 
     cpg = max(1, NUM_AI_CORES // NUM_GROUPS) # guaranteed cores per group    
@@ -290,21 +290,22 @@ def _shrink_op(
     K_NUM_BLOCKS = triton.cdiv(K, BLOCK_K)
     grid = (NUM_AI_CORES,)
 
-    constexprs = (NUM_GROUPS, # at most 20 -> not that much of compilation burden
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        NUM_SLICES,
-        N_NUM_BLOCKS,
-        MAX_TILES_PER_CORE, # powers of 2 -> not that much
-        K_NUM_BLOCKS,
-        NUM_AI_CORES,
-        TRITON_DTYPE,
-        output_tensor.dtype != torch.float32,
-    )
-    if constexprs not in known_signatures:
-        known_signatures.add(constexprs)
-        print(constexprs)
- 
-    # output_tensor.zero_()
+#     constexprs = (
+#         NUM_GROUPS, # at most 20 -> not that much of compilation burden
+#         BLOCK_M, BLOCK_N, BLOCK_K,
+#         NUM_SLICES,
+#         N_NUM_BLOCKS,
+#         MAX_TILES_PER_CORE, # powers of 2 -> not that much
+#         K_NUM_BLOCKS,
+#         NUM_AI_CORES,
+#         TRITON_DTYPE,
+#         output_tensor.dtype != torch.float32,
+#     )
+#     if constexprs not in known_signatures:
+#         known_signatures.add(constexprs)
+#         print(constexprs)
+#  
+    output_tensor.zero_()
     _lora_shrink_kernel[grid](
         inputs, lora_ptr_tensor, output_tensor,
         b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
@@ -577,7 +578,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
         x = x.view(-1, x.shape[-1])
-        if USE_TRITON_KERNEL and x.shape[0] > 1024:
+        if self.token_nums > 2048:
             for slice_idx in range(len(lora_a_stacked)):
                 torch.ops.misha._shrink.default(
                         x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
@@ -585,7 +586,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 )
         else:
             for slice_idx in range(len(lora_a_stacked)):
-                self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
+                self.bgmv_shrink(x, lora_a_stacked[slice_idx], y[slice_idx],
+                                 self.token_lora_indices, scale)
 
     def add_expand(
         self,
