@@ -117,7 +117,7 @@ send_request() {
     local STRING=$2
     [ -n "$label" ] && echo "--> Testing: $label"
     
-    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 100,\"temperature\": 0.0}"
+    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 100,\"temperature\": 0.0,\"top_p\": 1.0,\"seed\": 42}"
 }
 
 run_evalscope() {

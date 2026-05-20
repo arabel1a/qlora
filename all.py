@@ -1,29 +1,30 @@
 from typing import List
 import torch
 import torch_npu
-# from .common import NUM_AI_CORES
 import triton
 import triton.language as tl
-
+import torch
 import os
 _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 NUM_AI_CORES=20
+import torch._dynamo
+from collections.abc import Callable
+import torch
+from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
+from vllm_ascend.lora.utils import refresh_all_lora_classes
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
 
 
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 # os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_debug"
-import torch
 # torch._dynamo.config.repro_after="dynamo"
 """Baseline implementations for LoRA shrink: native torch and C++ sgmv_shrink.
 
 Both accept compute_meta-style metadata (production format from vllm).
 The sgmv_shrink signature matches vllm_ascend/lora/lora_ops.py exactly.
 """
-
-import os
-import torch
-import vllm_ascend
 
 def sort_metadata(token_lora_tensor, b_seq_start_loc, seq_len_tensor, lora_indices_tensor, batch_size, max_length, token_nums, no_lora):      
     return (
@@ -287,7 +288,7 @@ def _shrink_op(
     
     N_NUM_BLOCKS = triton.cdiv(N, BLOCK_N)
     K_NUM_BLOCKS = triton.cdiv(K, BLOCK_K)
-    grid = lambda meta: (NUM_AI_CORES,)
+    grid = (NUM_AI_CORES,)
 
     constexprs = (NUM_GROUPS, # at most 20 -> not that much of compilation burden
         BLOCK_M, BLOCK_N, BLOCK_K,
@@ -372,8 +373,6 @@ triton_shrink = torch.ops.misha._shrink.default
 
 print ("hui " * 10)
 
-# SPDX-License-Identifier: Apache-2.0
-import os
 
 USE_STUB_KERNEL=int(os.environ.get("VLLM_LORA_USE_STUB_KERNEL", 0))
 USE_TRITON_KERNEL=int(os.environ.get("VLLM_LORA_USE_TRITON_KERNEL", 0))
@@ -383,26 +382,12 @@ SPLIT_PREFILL_DECODE=os.environ.get("VLLM_LORA_SPLIT_PREFILL_DECODE")
 if sum([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL]) > 1:
     raise ValueError("Choose one kernel, man.")
     
-import torch._dynamo
-from collections.abc import Callable
-import torch
-from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
-from vllm_ascend.lora.utils import refresh_all_lora_classes
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
 PATCHED_KERNEL = True # any([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL])
 if PATCHED_KERNEL:
     print("\n" * 10)
     print(f"WARNING: Misha patched lora kernels {USE_STUB_KERNEL=} {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
     print("\n" * 10)
-#     import sys
-#     sys.path.insert(0, '/home/russia_mmo/misha/kernels_profiling')
-#     from baselines import torch_shrink, sgmv_shrink, sort_metadata, stub_shrink
-#     from triton_lora import shrink as triton_shrink
-#     
-# 
-# The platforms that are compatible with the PyTorch-native implementation can
-# inherit this class
+
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
     PunicaWrapperNPU is designed to manage and provide metadata for the punica
@@ -592,12 +577,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
         x = x.view(-1, x.shape[-1])
-        if USE_TRITON_KERNEL and self.is_prefill:
-            torch.ops.misha._shrink.default(
-                x, list(lora_a_stacked),
-                torch.stack(list(y)),
-                *self.prefill_metadata, scale,
-            )
+        if USE_TRITON_KERNEL and x.shape[0] > 1024:
+            for slice_idx in range(len(lora_a_stacked)):
+                torch.ops.misha._shrink.default(
+                        x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
+                    *self.prefill_metadata, scale
+                )
         else:
             for slice_idx in range(len(lora_a_stacked)):
                 self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
