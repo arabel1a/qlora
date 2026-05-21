@@ -8,6 +8,7 @@ export HOST=0.0.0.0
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export VLLM_USE_V1=1
 export ASCEND_RT_VISIBLE_DEVICES=$DEVICES
 export NPU_VISIBLE_DEVICES=$DEVICES
 export VLLM_RPC_TIMEOUT=100000
@@ -17,10 +18,10 @@ export LONG_STRING=aabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaaba
 # export SERVED_MODEL_NAME="qwen3"
 # export SERVED_MODEL_NAME_LORA="lora-adapter"
 # export MAX_NUM_SEQ=64
-export MODEL_TAG="Qwen3-4B-Instruct-2507"
-#export MODEL_TAG="Qwen3-32B"
-export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
-#export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-32B-lora"
+# export MODEL_TAG="Qwen3-4B-Instruct-2507"
+export MODEL_TAG="Qwen3-32B"
+#export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
+export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-32B-lora"
 export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
 export MAX_LORAS=20 # IMPORTANT! number of loras per batch can not exceed the number of AI cubes
 export MAX_LORA_RANK=32
@@ -38,13 +39,13 @@ export START_TIMEOUT=300
 export STOP_TIMEOUT=30
 
 # vllm
-export TENSOR_PARALLEL_SIZE=1
+export TENSOR_PARALLEL_SIZE=4
 export DATA_PARALLEL_SIZE=1
 export MAX_NUM_SEQ=32
 : "${MAX_MODEL_LEN:=32768}"
-: "${MAX_NUM_BATCHED_TOKENS:=65535}"
-export MEMORY_UTILIZATION=0.95
-export DTYPE="float16"
+: "${MAX_NUM_BATCHED_TOKENS:=32768}"
+export MEMORY_UTILIZATION=0.8
+export DTYPE="bfloat16"
 export BLOCK_SIZE=128
 
 COMMON_VLLM_ARGS=(
@@ -58,8 +59,8 @@ COMMON_VLLM_ARGS=(
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --no-enable-prefix-caching
-    --no-enable-chunked-prefill
     --trust-remote-code
+    #--no-enable-chunked-prefill
 )
 
 LORA_ARGS=(
@@ -91,8 +92,8 @@ run_lora_server() {
     # shitty pydantic does not digest spaces in json...
     SERVER_ARGS=(
     # --additional_config '{"ascend_compilation_config":{"enable_npugraph_ex":false}}'
-    --compilation-config '{"max_cudagraph_capture_size":176}'
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    # --compilation-config '{"max_cudagraph_capture_size":176}'
+    # --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
     --port $PORT
     --host=$HOST
     )
@@ -104,7 +105,7 @@ run_server() {
     # shitty pydantic does not digest spaces in json...
     SERVER_ARGS=(
     # --additional_config '{"torchair_graph_config":{"enable":false},"ascend_scheduler_config":{"enabled":false,"enable_chunked_prefill":false,"chunked_prefill_enabled":false}}'
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    # --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
     --port $PORT
     --host=$HOST
     )
@@ -124,7 +125,7 @@ send_request() {
     local STRING=$2
     [ -n "$label" ] && echo "--> Testing: $label"
     
-    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 100,\"temperature\": 0.0,\"top_p\": 1.0,\"seed\": 42}"
+    time curl -s -X POST "http://localhost:${PORT}/v1/completions" -H "Content-Type: application/json" -d "{\"prompt\": \"${STRING}\",\"model\": \"${model_name}\",\"max_tokens\": 10,\"temperature\": 0.0,\"top_p\": 1.0,\"seed\": 42}"
 }
 
 profile(){
@@ -134,7 +135,7 @@ profile(){
     start_profile
     send_request $1 $2
     stop_profile
-    python -c 'from torch_npu.profiler.profiler import analyse;analyse("./logs/qlora_profile")'
+    # python -c 'from torch_npu.profiler.profiler import analyse;analyse("./logs/qlora_profile")'
 }
 
 run_evalscope() {

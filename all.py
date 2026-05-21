@@ -15,7 +15,7 @@ from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
-
+out = 0
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 # os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_debug"
@@ -248,7 +248,10 @@ def _shrink_op(
     max_length: int,  # longest group
     token_nums: int,  # total tokens
     scaling: float,
+    no_lora: torch.Tensor,
 ) -> None:
+    if no_lora.item():
+        return
     # assert NUM_GROUPS <= NUM_AI_CORES, f"{NUM_GROUPS}"
     NUM_GROUPS = 1
     # assert inputs.dtype == lora_a_weights[0].dtype
@@ -336,6 +339,7 @@ def _shrink_fake(
     max_length: int,
     token_nums: int,
     scaling: float,
+    no_lora: torch.Tensor,
 ) -> None:
     """
     Meta-kernel for torch.compile to trace shapes and dtypes.
@@ -430,6 +434,18 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             self.triton_shrink = triton_shrink
             self.torch_shrink = torch_shrink
             self.stub_shrink = stub_shrink
+            self._no_lora_indices = torch.full(
+                (max_num_batched_tokens,), -1, dtype=torch.long, device=device
+            )
+            self._use_triton_tensor = torch.tensor(False, dtype=torch.bool, device=device)
+            self._use_triton_cpu = torch.tensor(False, dtype=torch.bool)
+
+    def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
+        super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
+        if PATCHED_KERNEL:
+            val = self.token_nums > 2048
+            self._use_triton_tensor.fill_(val)
+            self._use_triton_cpu.fill_(val)
 
     def _shrink_prefill(
         self,
@@ -578,16 +594,21 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
         x = x.view(-1, x.shape[-1])
-        if self.token_nums > 2048:
-            for slice_idx in range(len(lora_a_stacked)):
-                torch.ops.misha._shrink.default(
-                        x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
-                    *self.prefill_metadata, scale
-                )
-        else:
-            for slice_idx in range(len(lora_a_stacked)):
-                self.bgmv_shrink(x, lora_a_stacked[slice_idx], y[slice_idx],
-                                 self.token_lora_indices, scale)
+        n = x.shape[0]
+        bgmv_indices = torch.where(
+            self._use_triton_tensor,
+            self._no_lora_indices[:n],
+            self._token_lora_indices[:n],
+        )
+        triton_no_lora = self._use_triton_cpu.logical_not()
+        for slice_idx in range(len(lora_a_stacked)):
+            torch.ops.misha._shrink.default(
+                x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
+                *self.prefill_metadata, scale,
+                triton_no_lora,
+            )
+            self.bgmv_shrink(x, lora_a_stacked[slice_idx], y[slice_idx],
+                             bgmv_indices, scale)
 
     def add_expand(
         self,
