@@ -20,10 +20,11 @@ export LONG_STRING=aabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaaba
 # export MAX_NUM_SEQ=64
 # export MODEL_TAG="Qwen3-4B-Instruct-2507"
 export MODEL_TAG="Qwen3-32B"
-#export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-4b-nsfw"
-export LORA_ADAPTER="/home/russia_mmo/models/Qwen3-32B-lora"
+# export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-4b-nsfw"
+export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-32B-lora"
+export LORA_ADAPTER2="/home/russia_mmo/models/Qwen3-32B-lora-r8"
 export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
-export MAX_LORAS=20 # IMPORTANT! number of loras per batch can not exceed the number of AI cubes
+export MAX_LORAS=2 # IMPORTANT! number of loras per batch can not exceed the number of AI cubes
 export MAX_LORA_RANK=32
 
 # benchmarks
@@ -65,9 +66,9 @@ COMMON_VLLM_ARGS=(
 
 LORA_ARGS=(
   --enable-lora
-  --max-loras $MAX_LORAS
+#   --max-loras $MAX_LORAS
   --max-lora-rank $MAX_LORA_RANK
-  --lora-modules lora-adapter=${LORA_ADAPTER}
+  --lora-modules lora-adapter1=${LORA_ADAPTER1} lora-adapter2=${LORA_ADAPTER2}
 )
 
 throughput_bench() {
