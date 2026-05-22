@@ -94,7 +94,7 @@ run_lora_server() {
     SERVER_ARGS=(
     # --additional_config '{"ascend_compilation_config":{"enable_npugraph_ex":false}}'
     # --compilation-config '{"max_cudagraph_capture_size":176}'
-    # --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
     --port $PORT
     --host=$HOST
     )
