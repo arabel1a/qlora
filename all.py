@@ -206,11 +206,7 @@ def _shrink_op(
     if no_lora.item():
         return
 
-    assert inputs.dtype == lora_a_weights[0].dtype
-    assert inputs.dtype in [torch.float16, torch.bfloat16]
     TRITON_DTYPE = tl.float16 if inputs.dtype == torch.float16 else tl.bfloat16
-    assert inputs.is_contiguous()
-    assert output_tensor.is_contiguous()
 
     # constants
     M = inputs.size(0)
@@ -218,20 +214,12 @@ def _shrink_op(
         NUM_LORAS, N, K = lora_a_weights[0].shape
     else:
         NUM_LORAS, _, N, K = lora_a_weights[0].shape
-        assert _ == 1
 
     NUM_SLICES = len(lora_a_weights)
-    BLOCK_M = 32
-    BLOCK_N = 32
-    BLOCK_K = 32
-
-    assert inputs.shape == (M, K)
-    assert output_tensor.shape == (NUM_SLICES, M, N)
 
     lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2 = (
         _get_lora_a_ptr(lora_a_weights, inputs.device)
     )
-    assert (lora_strides_d0, lora_strides_d1, lora_strides_d2) == (K * N, K, 1)
 
     MAX_TILES_PER_CORE = max_tiles_per_core
 
