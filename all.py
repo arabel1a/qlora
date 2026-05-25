@@ -5,8 +5,6 @@ import triton
 import triton.language as tl
 import torch
 import os
-_LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
-NUM_AI_CORES=20
 import torch._dynamo
 from collections.abc import Callable
 import torch
@@ -15,60 +13,9 @@ from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
-out = 0
-# os.environ["MLIR_ENABLE_DUMP"] = "1"
-# os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
-# os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_debug"
-# torch._dynamo.config.repro_after="dynamo"
-"""Baseline implementations for LoRA shrink: native torch and C++ sgmv_shrink.
-
-Both accept compute_meta-style metadata (production format from vllm).
-The sgmv_shrink signature matches vllm_ascend/lora/lora_ops.py exactly.
-"""
-
-def sort_metadata(token_lora_tensor, b_seq_start_loc, seq_len_tensor, lora_indices_tensor, batch_size, max_length, token_nums, no_lora):      
-    return (
-        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,  
-        batch_size, max_length, token_nums, 
-    )
-
-
-@torch.no_grad()
-def stub_shrink(
-    inputs: torch.Tensor,  # (num_tokens_in_batch, hidden_size)
-    lora_a_weights: torch.Tensor,  # (num_loras, rank, hidden_size)
-    output_tensor: torch.Tensor,  # (num_tokens_in_batch, hidden_size)
-    b_seq_start_loc: torch.Tensor,  # (N_groups) - token indices where lora adapter changes. N_groups < N_requests
-    seq_len_tensor: torch.Tensor,  # exactly b_seq_start_loc[1:] - b_seq_start_loc[:1]
-    lora_indices_tensor: torch.Tensor,  # (N_groups) group idx -> lora idx
-    batches: int,  # N_groups
-    max_seq_length: int,  # seq_len_tensor.max.items()
-    token_nums: int,  # num_tokens_in_batch
-    scaling: float,
-) -> None:
-    pass
-    
-@torch.no_grad()
-def torch_shrink(
-    inputs: torch.Tensor,
-    lora_a_weights: torch.Tensor,
-    output_tensor: torch.Tensor,
-    b_seq_start_loc: torch.Tensor,
-    seq_len_tensor: torch.Tensor,
-    lora_indices_tensor: torch.Tensor,
-    batches: int,
-    max_seq_length: int,
-    token_nums: int, 
-    scaling: float,
-) -> None:
-    token_indices = torch.arange(inputs.shape[0], device=inputs.device)
-    group_id_per_token = torch.bucketize(token_indices, b_seq_start_loc, right=True) - 1
-    token_to_lora_idx = lora_indices_tensor[group_id_per_token]
-    for slice_idx in range(len(lora_a_weights)):
-        token_to_lora = lora_a_weights[slice_idx][token_to_lora_idx].squeeze(1)
-        # lora_output = torch.einsum("th,tlh->tl", inputs, token_to_lora)
-        lora_output = torch.matmul(inputs.unsqueeze(1), token_to_lora.transpose(-1, -2)).squeeze(1)
-        output_tensor[slice_idx, ...] = lora_output * scaling
+_LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
+NUM_AI_CORES=20
+PREFIL_DECODE_THOLD=1024
 
 def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     """
@@ -78,7 +25,7 @@ def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     https://github.com/triton-lang/triton/blob/release/3.1.x/python/tutorials/08-grouped-gemm.py
     """
     key = tuple(lora_weight.data_ptr() for lora_weight in lora_a_weights)
-
+    
     if values := _LORA_A_PTR_DICT.get(key):
         return values
 
@@ -139,23 +86,34 @@ def _lora_shrink_kernel(
 ):
     pid = tl.program_id(axis=0)
 
+    # only count tokens and groups that have a real lora adapter
     total = 0
+    num_active = 0
     for g in range(NUM_GROUPS):
-        total += tl.load(seq_len_tensor + g).to(tl.int32)
+        lora_idx_g = tl.load(lora_indices_tensor + g)
+        seq_len_g = tl.load(seq_len_tensor + g).to(tl.int32)
+        is_active = lora_idx_g >= 0
+        total += tl.where(is_active, seq_len_g, 0)
+        num_active += tl.where(is_active, 1, 0)
 
-    # scheduligng: each core gets single lora, 
-    # each lora block is gets cores proportinally to length
+    if total == 0:
+        return
+
+    # scheduling: split all cores only among active groups, proportionally
     used_cores = 0
     my_first_token = 0
     my_last_token = 0
     lora_id = tl.zeros((), dtype=tl.int64)
     for g in range(NUM_GROUPS):
+        lora_idx_g = tl.load(lora_indices_tensor + g)
         seq_len = tl.load(seq_len_tensor + g)
-        # split cores proportionally to seq_at least one core each
-        # assumes NUM_AI_CORES > NUM_GROUPS !
-        cores_for_g = 1 + (NUM_AI_CORES - NUM_GROUPS) * seq_len // total
-        # cores_for_g = tl.maximum(1, (seq_len * NUM_AI_CORES + total - 1) // total)
-        chunk = seq_len // cores_for_g
+        is_active = lora_idx_g >= 0
+
+        cores_for_g = tl.where(is_active,
+            1 + (NUM_AI_CORES - num_active) * seq_len // total,
+            0)
+        cores_for_g_safe = tl.maximum(cores_for_g, 1)
+        chunk = seq_len // cores_for_g_safe
         after_this_used_cores = used_cores + cores_for_g
 
         # check if current pid within this group
@@ -164,21 +122,14 @@ def _lora_shrink_kernel(
 
         # find tokens
         grp_start = tl.load(b_seq_start_loc + g)
-        if is_my_group:
-            my_first_token = (grp_start + local * chunk).to(tl.int32)
-            my_last_token = tl.where(local < cores_for_g - 1,grp_start + local * chunk + chunk, grp_start + seq_len).to(tl.int32)
-        # my_first_token = tl.where(
-        #     is_my_group, (grp_start + local * chunk).to(tl.int32), 0
-        # )
-        # my_last_token = tl.where(
-        #     is_my_group, tl.where(local < cores_for_g - 1,grp_start + local * chunk + chunk,grp_start + seq_len), 0
-        # ).to(tl.int32)
+        token_start = (grp_start + local * chunk).to(tl.int32)
+        token_end = tl.where(local < cores_for_g - 1, grp_start + local * chunk + chunk, grp_start + seq_len).to(tl.int32)
+        my_first_token = tl.where(is_my_group, token_start, my_first_token)
+        my_last_token = tl.where(is_my_group, token_end, my_last_token)
         used_cores = after_this_used_cores.to(tl.int32)
         lora_id = tl.where(is_my_group, tl.load(lora_indices_tensor + g), lora_id).to(tl.int64)
 
     if my_last_token == my_first_token:
-        return
-    if lora_id < 0:
         return
     for slice_id in tl.static_range(SLICE_NUM):
         if SLICE_NUM == 1:
@@ -234,10 +185,6 @@ def _lora_shrink_kernel(
                 tl.store(c_block_ptr, accumulator, boundary_check=(0, 1))
 
 
-# @torch.inference_mode()
-# @torch.no_grad()
-known_signatures = set()
-print_cint = 0
 @torch.library.custom_op("misha::_shrink", mutates_args=("output_tensor",))
 def _shrink_op(
     inputs: torch.Tensor, # M x K
@@ -254,6 +201,7 @@ def _shrink_op(
 ) -> None:
     if no_lora.item():
         return
+
     # assert NUM_GROUPS <= NUM_AI_CORES, f"{NUM_GROUPS}"
     NUM_GROUPS = 1
     # assert inputs.dtype == lora_a_weights[0].dtype
@@ -374,27 +322,8 @@ def _shrink_fake(
     # )
     
     return None
-
 triton_shrink = torch.ops.misha._shrink.default
-
-
-print ("hui " * 10)
-
-
-USE_STUB_KERNEL=int(os.environ.get("VLLM_LORA_USE_STUB_KERNEL", 0))
-USE_TRITON_KERNEL=int(os.environ.get("VLLM_LORA_USE_TRITON_KERNEL", 0))
-USE_TORCH_KERNEL=int(os.environ.get("VLLM_LORA_USE_TORCH_KERNEL", 0))
-SPLIT_PREFILL_DECODE=os.environ.get("VLLM_LORA_SPLIT_PREFILL_DECODE")
-
-if sum([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL]) > 1:
-    raise ValueError("Choose one kernel, man.")
-    
-PATCHED_KERNEL = True # any([USE_STUB_KERNEL, USE_TORCH_KERNEL, USE_TRITON_KERNEL])
-if PATCHED_KERNEL:
-    print("\n" * 10)
-    print(f"WARNING: Misha patched lora kernels {USE_STUB_KERNEL=} {USE_TORCH_KERNEL=} {USE_TRITON_KERNEL=}")
-    print("\n" * 10)
-
+   
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
     PunicaWrapperNPU is designed to manage and provide metadata for the punica
@@ -474,7 +403,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         scale: float,
     ):
-        # print("decode")
         self.bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
 
     def _expand_prefill(
