@@ -178,6 +178,8 @@ def _lora_shrink_kernel(
 
     if my_last_token == my_first_token:
         return
+    if lora_id < 0:
+        return
     for slice_id in tl.static_range(SLICE_NUM):
         if SLICE_NUM == 1:
             slice_base = lora_ptr
