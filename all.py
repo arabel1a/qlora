@@ -16,6 +16,9 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 NUM_AI_CORES=20
 PREFIL_DECODE_THOLD=1024
+BLOCK_M = 32
+BLOCK_N = 32
+BLOCK_K = 32
 
 def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     """
@@ -198,78 +201,55 @@ def _shrink_op(
     token_nums: int,  # total tokens
     scaling: float,
     no_lora: torch.Tensor,
+    max_tiles_per_core: int,
 ) -> None:
     if no_lora.item():
         return
 
-    # assert NUM_GROUPS <= NUM_AI_CORES, f"{NUM_GROUPS}"
-    NUM_GROUPS = 1
-    # assert inputs.dtype == lora_a_weights[0].dtype
-    # assert inputs.dtype in [torch.float16, torch.bfloat16]
+    assert inputs.dtype == lora_a_weights[0].dtype
+    assert inputs.dtype in [torch.float16, torch.bfloat16]
     TRITON_DTYPE = tl.float16 if inputs.dtype == torch.float16 else tl.bfloat16
-    # assert inputs.is_contiguous()
-    # assert output_tensor.is_contiguous()
-    
+    assert inputs.is_contiguous()
+    assert output_tensor.is_contiguous()
+
     # constants
     M = inputs.size(0)
     if len(lora_a_weights[0].shape) == 3:
         NUM_LORAS, N, K = lora_a_weights[0].shape
     else:
         NUM_LORAS, _, N, K = lora_a_weights[0].shape
-        # assert _ == 1
+        assert _ == 1
 
     NUM_SLICES = len(lora_a_weights)
-    # kernel_config = get_lora_op_configs()
-    BLOCK_M = 32 # = kernel_config["block_m"]
-    BLOCK_N = 32 # = kernel_config["block_n"]
-    BLOCK_K = 32 # = kernel_config["block_k"]
+    BLOCK_M = 32
+    BLOCK_N = 32
+    BLOCK_K = 32
 
-    # assert inputs.shape == (M, K)
-    # assert output_tensor.shape == (NUM_SLICES, M, N)
+    assert inputs.shape == (M, K)
+    assert output_tensor.shape == (NUM_SLICES, M, N)
 
     lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2 = (
         _get_lora_a_ptr(lora_a_weights, inputs.device)
     )
-    # assert (lora_strides_d0, lora_strides_d1, lora_strides_d2) == (K * N, K, 1)
+    assert (lora_strides_d0, lora_strides_d1, lora_strides_d2) == (K * N, K, 1)
 
-    cpg = max(1, NUM_AI_CORES // NUM_GROUPS) # guaranteed cores per group    
-    tpc = triton.cdiv(max_length, cpg) # worst case token per group
-    MAX_TILES_PER_CORE = 2 * triton.next_power_of_2(triton.cdiv(tpc, BLOCK_M)) # worst case tile per group
+    MAX_TILES_PER_CORE = max_tiles_per_core
 
-    # perfect cshedule will get something like
-    # MAX_TILES_PER_CORE = triton.next_power_of_2(token_nums // NUM_AI_CORES //BLOCK_M)
-    
     N_NUM_BLOCKS = triton.cdiv(N, BLOCK_N)
     K_NUM_BLOCKS = triton.cdiv(K, BLOCK_K)
     grid = (NUM_AI_CORES,)
 
-#     constexprs = (
-#         NUM_GROUPS, # at most 20 -> not that much of compilation burden
-#         BLOCK_M, BLOCK_N, BLOCK_K,
-#         NUM_SLICES,
-#         N_NUM_BLOCKS,
-#         MAX_TILES_PER_CORE, # powers of 2 -> not that much
-#         K_NUM_BLOCKS,
-#         NUM_AI_CORES,
-#         TRITON_DTYPE,
-#         output_tensor.dtype != torch.float32,
-#     )
-#     if constexprs not in known_signatures:
-#         known_signatures.add(constexprs)
-#         print(constexprs)
-#  
     output_tensor.zero_()
     _lora_shrink_kernel[grid](
         inputs, lora_ptr_tensor, output_tensor,
         b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
         M, N, K,
         scaling,
-        # constexprs
-        NUM_GROUPS, # at most 20 -> not that much of compilation burden
+        NUM_GROUPS,
         BLOCK_M, BLOCK_N, BLOCK_K,
         NUM_SLICES,
         N_NUM_BLOCKS,
-        MAX_TILES_PER_CORE, # powers of 2 -> not that much
+        MAX_TILES_PER_CORE,
         K_NUM_BLOCKS,
         NUM_AI_CORES,
         TRITON_DTYPE,
@@ -290,6 +270,7 @@ def _shrink_fake(
     token_nums: int,
     scaling: float,
     no_lora: torch.Tensor,
+    max_tiles_per_core: int,
 ) -> None:
     """
     Meta-kernel for torch.compile to trace shapes and dtypes.
@@ -361,22 +342,37 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand = sgmv_expand
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
-        if PATCHED_KERNEL:
-            self.triton_shrink = triton_shrink
-            self.torch_shrink = torch_shrink
-            self.stub_shrink = stub_shrink
-            self._no_lora_indices = torch.full(
-                (max_num_batched_tokens,), -1, dtype=torch.long, device=device
-            )
-            self._use_triton_tensor = torch.tensor(False, dtype=torch.bool, device=device)
-            self._use_triton_cpu = torch.tensor(False, dtype=torch.bool)
+
+        self._no_lora_indices = torch.full(
+            (max_num_batched_tokens,), -1, dtype=torch.long, device=device
+        )
+        self._use_triton_tensor = torch.tensor(False, dtype=torch.bool, device=device)
+        self._use_triton_cpu = torch.tensor(False, dtype=torch.bool)
+        self._triton_no_lora = torch.tensor(True, dtype=torch.bool)
+        self._max_tiles_per_core = 1
+        self._bgmv_indices = self._token_lora_indices[:0]
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
-        if PATCHED_KERNEL:
-            val = self.token_nums > 2048
-            self._use_triton_tensor.fill_(val)
-            self._use_triton_cpu.fill_(val)
+        assert self.batch_size <= NUM_AI_CORES, f"NUM_GROUPS ({self.batch_size}) > NUM_AI_CORES ({NUM_AI_CORES})"
+
+        val = self.token_nums > PREFIL_DECODE_THOLD
+        self._use_triton_tensor.fill_(val)
+        self._use_triton_cpu.fill_(val)
+
+        n = self.token_nums
+        self._bgmv_indices = torch.where(
+            self._use_triton_tensor,
+            self._no_lora_indices[:n],
+            self._token_lora_indices[:n],
+        )
+        self._triton_no_lora = self._use_triton_cpu.logical_not()
+
+        cpg = max(1, NUM_AI_CORES // self.batch_size)
+        tpc = triton.cdiv(self.max_length, cpg)
+        self._max_tiles_per_core = 2 * triton.next_power_of_2(triton.cdiv(tpc, BLOCK_M))
+
+        # TODO: move the whole scheduling here
 
     def _shrink_prefill(
         self,
@@ -524,21 +520,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
         x = x.view(-1, x.shape[-1])
-        n = x.shape[0]
-        bgmv_indices = torch.where(
-            self._use_triton_tensor,
-            self._no_lora_indices[:n],
-            self._token_lora_indices[:n],
-        )
-        triton_no_lora = self._use_triton_cpu.logical_not()
         for slice_idx in range(len(lora_a_stacked)):
             torch.ops.misha._shrink.default(
                 x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
                 *self.prefill_metadata, scale,
-                triton_no_lora,
+                self._triton_no_lora,
+                self._max_tiles_per_core,
             )
             self.bgmv_shrink(x, lora_a_stacked[slice_idx], y[slice_idx],
-                             bgmv_indices, scale)
+                             self._bgmv_indices, scale)
 
     def add_expand(
         self,
