@@ -160,8 +160,8 @@ run_evalscope() {
         --url "$URL" \
         --dataset custom \
         --dataset-path "$DATASET" \
-        --max-tokens 512 \
-        --min-tokens 512 \
+        --max-tokens $RANDOM_OUTPUT_LEN \
+        --min-tokens $RANDOM_OUTPUT_LEN \
         --prefix-length 0 \
         --extra-args '{"ignore_eos": true}' \
         --outputs-dir "logs/${label}" \

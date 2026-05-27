@@ -1,303 +1,117 @@
+from collections.abc import Callable
 from typing import List
+
 import torch
 import torch_npu
-import triton
-import triton.language as tl
-import torch
-import os
-import torch._dynamo
-from collections.abc import Callable
-import torch
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
-_LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
-NUM_AI_CORES=20
-PREFIL_DECODE_THOLD=1024
-BLOCK_M = 32
-BLOCK_N = 32
-BLOCK_K = 32
-
-def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
-    """
-    `_LORA_A_PTR_DICT` collects the required information during `profile_run`,
-    After this, it remains constant and subsequent usage is through LUT.
-    Refer to:
-    https://github.com/triton-lang/triton/blob/release/3.1.x/python/tutorials/08-grouped-gemm.py
-    """
-    key = tuple(lora_weight.data_ptr() for lora_weight in lora_a_weights)
-    
-    if values := _LORA_A_PTR_DICT.get(key):
-        return values
-
-    lora_strides_d0 = []
-    lora_strides_d1 = []
-    lora_strides_d2 = []
-    tensor_ptrs = []
-    for lora_a_weight in lora_a_weights:
-        if lora_a_weight.ndim == 4:  # shape:(lora_num,1,size,rank)
-            assert lora_a_weight.size(1) == 1
-            lora_a_weight = lora_a_weight.squeeze(dim=1)
-        else:
-            assert lora_a_weight.ndim == 3  # shape:(lora_num,size,rank)
-        assert lora_a_weight.is_contiguous()
-        tensor_ptrs.append(lora_a_weight.data_ptr())
-        lora_strides_d0.append(lora_a_weight.stride(0))
-        lora_strides_d1.append(lora_a_weight.stride(1))
-        lora_strides_d2.append(lora_a_weight.stride(2))
-    if len(lora_a_weights) > 1:
-        lora_ptr_tensor = torch.tensor(tensor_ptrs, device=device, dtype=torch.uint64)
-    else:
-        lora_ptr_tensor = lora_a_weights[0]
-
-    if (
-        len(set(lora_strides_d0)) > 1
-        or len(set(lora_strides_d1)) > 1
-        or len(set(lora_strides_d2)) > 1
-    ):
-        raise ValueError("All LoRA weights must have the same stride.")
-
-    _LORA_A_PTR_DICT[key] = (
-        lora_ptr_tensor,
-        lora_strides_d0[0],
-        lora_strides_d1[0],
-        lora_strides_d2[0],
-    )
-    return _LORA_A_PTR_DICT.get(key)
+_TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 
 
-
-@triton.jit
-def _lora_shrink_kernel(
-    input_ptr, lora_ptr, out_ptr,  # data
-    b_seq_start_loc, seq_len_tensor, lora_indices_tensor,  # indices
-    M, N, K,  # sizes
-    scaling,  # fp32 scale
-    NUM_GROUPS: tl.constexpr, # and this
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    SLICE_NUM: tl.constexpr,
-    N_NUM_BLOCKS: tl.constexpr,
-    MAX_TILES_PER_CORE: tl.constexpr, # not super sure whethter this should be constexpr
-    K_NUM_BLOCKS: tl.constexpr,
-    NUM_AI_CORES: tl.constexpr,
-    DTYPE: tl.constexpr,
-    CAST:  tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-
-    # only count tokens and groups that have a real lora adapter
-    total = 0
-    num_active = 0
-    for g in range(NUM_GROUPS):
-        lora_idx_g = tl.load(lora_indices_tensor + g)
-        seq_len_g = tl.load(seq_len_tensor + g).to(tl.int32)
-        is_active = lora_idx_g >= 0
-        total += tl.where(is_active, seq_len_g, 0)
-        num_active += tl.where(is_active, 1, 0)
-
-    if total == 0:
-        return
-
-    # scheduling: split all cores only among active groups, proportionally
-    used_cores = 0
-    my_first_token = 0
-    my_last_token = 0
-    lora_id = tl.zeros((), dtype=tl.int64)
-    for g in range(NUM_GROUPS):
-        lora_idx_g = tl.load(lora_indices_tensor + g)
-        seq_len = tl.load(seq_len_tensor + g)
-        is_active = lora_idx_g >= 0
-
-        cores_for_g = tl.where(is_active,
-            1 + (NUM_AI_CORES - num_active) * seq_len // total,
-            0)
-        cores_for_g_safe = tl.maximum(cores_for_g, 1)
-        chunk = seq_len // cores_for_g_safe
-        after_this_used_cores = used_cores + cores_for_g
-
-        # check if current pid within this group
-        local = pid - used_cores
-        is_my_group = (pid >= used_cores) & (pid < after_this_used_cores)
-
-        # find tokens
-        grp_start = tl.load(b_seq_start_loc + g)
-        token_start = (grp_start + local * chunk).to(tl.int32)
-        token_end = tl.where(local < cores_for_g - 1, grp_start + local * chunk + chunk, grp_start + seq_len).to(tl.int32)
-        my_first_token = tl.where(is_my_group, token_start, my_first_token)
-        my_last_token = tl.where(is_my_group, token_end, my_last_token)
-        used_cores = after_this_used_cores.to(tl.int32)
-        lora_id = tl.where(is_my_group, tl.load(lora_indices_tensor + g), lora_id).to(tl.int64)
-
-    if my_last_token == my_first_token:
-        return
-    for slice_id in tl.static_range(SLICE_NUM):
-        if SLICE_NUM == 1:
-            slice_base = lora_ptr
-        else:
-            slice_base = tl.load(lora_ptr + slice_id).to(
-                 tl.pointer_type(DTYPE), bitcast=True
-             )
-
-        for tile_idx in range(MAX_TILES_PER_CORE):
-            row_start = my_first_token + tile_idx * BLOCK_M
-        
-            a_block_ptr = tl.make_block_ptr(
-                base=input_ptr,
-                shape=(my_last_token, K),
-                strides=(K, 1),
-                offsets=(row_start, 0),
-                block_shape=(BLOCK_M, BLOCK_K),
-                order=(1, 0),
-            )
-            
-            for n_blk in range(N_NUM_BLOCKS):
-                lora_base = slice_base + lora_id * K * N
-                b_block_ptr = tl.make_block_ptr(
-                    base=lora_base,
-                    shape=(K, N),
-                    strides=(1, K),
-                    offsets=(0, n_blk * BLOCK_N),
-                    block_shape=(BLOCK_K, BLOCK_N),
-                    order=(0, 1),
-                )
-                accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                for k_idx in range(K_NUM_BLOCKS):
-                    a_tile = tl.load(a_block_ptr, boundary_check=(0, 1))
-                    b_tile = tl.load(b_block_ptr, boundary_check=(0, 1))
-                    accumulator += tl.dot(a_tile, b_tile)
-                    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-                    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-
-                accumulator = (accumulator * scaling)
-                if CAST:
-                    accumulator = accumulator.to(DTYPE)
-
-                # [num_slices, num_tokens, rank] -> [num_slices * num_tokens, rank]
-                c_block_ptr = tl.make_block_ptr(
-                    base=out_ptr,
-                    shape=(slice_id * M + my_last_token, N),
-                    strides=(N, 1),
-                    offsets=(slice_id * M + row_start, n_blk * BLOCK_N),
-                    block_shape=(BLOCK_M, BLOCK_N),
-                    order=(1, 0),
-                )
-                tl.store(c_block_ptr, accumulator, boundary_check=(0, 1))
+def _get_transposed_weight(w: torch.Tensor) -> torch.Tensor:
+    key = w.data_ptr()
+    if (cached := _TRANSPOSED_WEIGHT_CACHE.get(key)) is not None:
+        return cached
+    if w.ndim == 4:
+        w = w.squeeze(1)
+    w_t = w.transpose(1, 2).contiguous()
+    _TRANSPOSED_WEIGHT_CACHE[key] = w_t
+    return w_t
 
 
-@torch.library.custom_op("misha::_shrink", mutates_args=("output_tensor",))
-def _shrink_op(
-    inputs: torch.Tensor, # M x K
-    lora_a_weights: List[torch.Tensor], # slices x loras x K x N
-    output_tensor: torch.Tensor, # slices x M x N
-    b_seq_start_loc: torch.Tensor,  # start of each group (of tokens sharing the adapter)
-    seq_len_tensor: torch.Tensor,  # token cnt per group
-    lora_indices_tensor: torch.Tensor,  # group -> lora mapping
-    NUM_GROUPS: int, # number of consecutive pieces of the same lora
-    max_length: int,  # longest group
-    token_nums: int,  # total tokens
-    scaling: float,
-    no_lora: torch.Tensor,
-    max_tiles_per_core: int,
-) -> None:
-    if no_lora.item():
-        return
-
-    TRITON_DTYPE = tl.float16 if inputs.dtype == torch.float16 else tl.bfloat16
-
-    # constants
-    M = inputs.size(0)
-    if len(lora_a_weights[0].shape) == 3:
-        NUM_LORAS, N, K = lora_a_weights[0].shape
-    else:
-        NUM_LORAS, _, N, K = lora_a_weights[0].shape
-
-    NUM_SLICES = len(lora_a_weights)
-
-    lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2 = (
-        _get_lora_a_ptr(lora_a_weights, inputs.device)
-    )
-
-    MAX_TILES_PER_CORE = max_tiles_per_core
-
-    N_NUM_BLOCKS = triton.cdiv(N, BLOCK_N)
-    K_NUM_BLOCKS = triton.cdiv(K, BLOCK_K)
-    grid = (NUM_AI_CORES,)
-
-    output_tensor.zero_()
-    _lora_shrink_kernel[grid](
-        inputs, lora_ptr_tensor, output_tensor,
-        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-        M, N, K,
-        scaling,
-        NUM_GROUPS,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        NUM_SLICES,
-        N_NUM_BLOCKS,
-        MAX_TILES_PER_CORE,
-        K_NUM_BLOCKS,
-        NUM_AI_CORES,
-        TRITON_DTYPE,
-        output_tensor.dtype != torch.float32,
-    )
+def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torch.Tensor:
+    w_t = _get_transposed_weight(w)
+    safe_indices = lora_indices.clamp(min=0)
+    gathered = w_t[safe_indices]
+    inactive = (lora_indices < 0).unsqueeze(1).unsqueeze(2)
+    gathered = gathered.masked_fill(inactive, 0.0)
+    return gathered
 
 
-@_shrink_op.register_fake
-def _shrink_fake(
+@torch.library.custom_op("lora::gmm_shrink", mutates_args=("output_tensor",))
+def _gmm_shrink_op(
     inputs: torch.Tensor,
-    lora_a_weights: List[torch.Tensor],
+    lora_a_weight: torch.Tensor,
     output_tensor: torch.Tensor,
     b_seq_start_loc: torch.Tensor,
     seq_len_tensor: torch.Tensor,
     lora_indices_tensor: torch.Tensor,
-    NUM_GROUPS: int,
+    batch_size: int,
     max_length: int,
     token_nums: int,
     scaling: float,
     no_lora: torch.Tensor,
-    max_tiles_per_core: int,
 ) -> None:
-    """
-    Meta-kernel for torch.compile to trace shapes and dtypes.
-    No actual computation happens here.
-    """
-    # torch._check(inputs.dim() == 2, lambda: f"Expected inputs to be 2D, got {inputs.dim()}D")
-    # M, K = inputs.shape
-    
-    # torch._check(len(lora_a_weights) > 0, lambda: "lora_a_weights cannot be empty")
-    
-    # w_shape = lora_a_weights[0].shape
-    # torch._check(len(w_shape) in (3, 4), lambda: f"Expected 3D or 4D lora weights, got {len(w_shape)}D")
-    
-    # if len(w_shape) == 3:
-    #     NUM_LORAS, N, K_weight = w_shape
-    # else:
-    #     NUM_LORAS, _, N, K_weight = w_shape
-        
-    # torch._check(K == K_weight, lambda: f"K mismatch: inputs K={K}, weights K={K_weight}")
-    
-    # NUM_SLICES = len(lora_a_weights)
-    
-    # out_shape = output_tensor.shape
-    # expected_shape_3d = (NUM_SLICES, M, N)
-    # expected_shape_2d = (NUM_SLICES * M, N)
-    
-    # torch._check(
-    #     out_shape == expected_shape_3d or out_shape == expected_shape_2d,
-    #     lambda: f"Unexpected output_tensor shape {out_shape}. Expected {expected_shape_3d}"
-    # )
-    
+    if no_lora.item():
+        return
+    gathered_w = _gather_weights_for_gmm(lora_a_weight, lora_indices_tensor)
+    x_in = inputs if inputs.dtype == gathered_w.dtype else inputs.to(gathered_w.dtype)
+    result = torch_npu.npu_grouped_matmul(
+        x=[x_in], weight=[gathered_w],
+        split_item=2, group_list_type=1, group_type=0,
+        group_list=seq_len_tensor,
+    )[0]
+    if scaling != 1.0:
+        result = result * scaling
+    output_tensor.add_(result.to(output_tensor.dtype))
+
+
+@_gmm_shrink_op.register_fake
+def _gmm_shrink_fake(inputs, lora_a_weight, output_tensor,
+                     b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+                     batch_size, max_length, token_nums, scaling, no_lora):
     return None
-triton_shrink = torch.ops.misha._shrink.default
-   
+
+
+@torch.library.custom_op("lora::gmm_expand_slice", mutates_args=("y",))
+def _gmm_expand_slice_op(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batch_size: int,
+    max_length: int,
+    token_nums: int,
+    y_offset: int,
+    y_slice_size: int,
+    add_inputs: bool,
+    no_lora: torch.Tensor,
+) -> None:
+    if no_lora.item():
+        return
+    gathered_w = _gather_weights_for_gmm(w, lora_indices_tensor)
+    x_in = x if x.dtype == gathered_w.dtype else x.to(gathered_w.dtype)
+    result = torch_npu.npu_grouped_matmul(
+        x=[x_in], weight=[gathered_w],
+        split_item=2, group_list_type=1, group_type=0,
+        group_list=seq_len_tensor,
+    )[0]
+    target = y[:, y_offset:y_offset + y_slice_size]
+    if add_inputs:
+        target.add_(result.to(target.dtype))
+    else:
+        target.copy_(result.to(target.dtype))
+
+
+@_gmm_expand_slice_op.register_fake
+def _gmm_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
+                           lora_indices_tensor, batch_size, max_length,
+                           token_nums, y_offset, y_slice_size, add_inputs, no_lora):
+    return None
+
+
+GMM_TOKEN_THRESHOLD = 1024
+
+
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
-    PunicaWrapperNPU is designed to manage and provide metadata for the punica
-    kernel. The main function is to maintain the state information for
-    Multi-LoRA, and to provide the interface for the pytorch punica ops.
+    PunicaWrapperNPU: dual-launch gmm + bgmv.
+    gmm in custom_op with early-exit flag; bgmv disabled via all -1 indices.
     """
 
     def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):
@@ -332,191 +146,45 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_shrink = sgmv_shrink
 
         self._no_lora_indices = torch.full(
-            (max_num_batched_tokens,), -1, dtype=torch.long, device=device
+            (max_num_batched_tokens,), -1, dtype=torch.long, device=device,
         )
-        self._use_triton_tensor = torch.tensor(False, dtype=torch.bool, device=device)
-        self._use_triton_cpu = torch.tensor(False, dtype=torch.bool)
-        self._triton_no_lora = torch.tensor(True, dtype=torch.bool)
-        self._max_tiles_per_core = 1
-        self._bgmv_indices = self._token_lora_indices[:0]
+        self._use_gmm_device = torch.tensor(False, dtype=torch.bool, device=device)
+        self._use_gmm_cpu = torch.tensor(False, dtype=torch.bool)
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
-        assert self.batch_size <= NUM_AI_CORES, f"NUM_GROUPS ({self.batch_size}) > NUM_AI_CORES ({NUM_AI_CORES})"
+        val = self.token_nums > GMM_TOKEN_THRESHOLD
+        self._use_gmm_device.fill_(val)
+        self._use_gmm_cpu.fill_(val)
 
-        val = self.token_nums > PREFIL_DECODE_THOLD
-        self._use_triton_tensor.fill_(val)
-        self._use_triton_cpu.fill_(val)
-
-        n = self.token_nums
-        self._bgmv_indices = torch.where(
-            self._use_triton_tensor,
+    def add_shrink(
+        self,
+        y: tuple[torch.Tensor, ...] | torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        scale: float,
+        **kwargs,
+    ):
+        x = x.view(-1, x.shape[-1])
+        n = x.shape[0]
+        bgmv_indices = torch.where(
+            self._use_gmm_device,
             self._no_lora_indices[:n],
             self._token_lora_indices[:n],
         )
-        self._triton_no_lora = self._use_triton_cpu.logical_not()
-
-        cpg = max(1, NUM_AI_CORES // self.batch_size)
-        tpc = triton.cdiv(self.max_length, cpg)
-        self._max_tiles_per_core = 2 * triton.next_power_of_2(triton.cdiv(tpc, BLOCK_M))
-
-        # TODO: move the whole scheduling here
-
-    def _shrink_prefill(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        scale: float,
-    ):
-        # No LoRA request, so return directly
-        if self.no_lora:
-            return
-        self.sgmv_shrink(
-            x,
-            w_t_all,
-            y,
-            *self.prefill_metadata,
-            scale,
-        )
-
-    def _shrink_decode(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        scale: float,
-    ):
-        self.bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
-
-    def _expand_prefill(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        add_inputs: bool,
-    ):
-        # No LoRA request, so return directly
-        if self.no_lora:
-            return
-        self.sgmv_expand(
-            x,
-            w_t_all,
-            y,
-            *self.prefill_metadata,
-            add_inputs,
-        )
-
-    def _expand_decode(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        add_inputs: bool,
-    ):
-        self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
-
-    def _expand_slice_prefill(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        y_offset: int,
-        y_slice_size: int,
-        add_inputs: bool,
-    ):
-        # No LoRA request, so return directly
-        if self.no_lora:
-            return
-        self.sgmv_expand_slice(
-            x,
-            w_t_all,
-            y,
-            *self.prefill_metadata,
-            y_offset,
-            y_slice_size,
-            add_inputs,
-        )
-
-    def _expand_slice_decode(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        y_offset: int,
-        y_slice_size: int,
-        add_inputs: bool,
-    ):
-        self.bgmv_expand_slice(x, w_t_all, y, self.token_lora_indices, y_offset, y_slice_size, add_inputs)
-
-    def _apply_expand(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        w_t_all: torch.Tensor,
-        y_offset: int,
-        y_slice_size: int,
-        add_inputs: bool = True,
-    ):
-        """
-        Perform the ` y[:,y_offset:y_offset+y_slice_size]+=x@w_t_all`
-        computation, which is suitable for the
-        GEMM of lora'b.
-        """
-
-        expand_slice_fun: Callable = self._expand_slice_prefill if self.is_prefill else self._expand_slice_decode
-        expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
-
-    def _apply_shrink(self, y: torch.Tensor, x: torch.Tensor, w_t_all: torch.Tensor, scale: float):
-        """
-        Perform the ` y+=x@w_t_all` computation, which is suitable for the
-        GEMM of lora'a.
-        When `is_prefill is` true, it indicates that it is currently the
-        prefill stage, and the `_shrink_prefill` function should be called.
-        Otherwise, it is the decode stage, and the _shrink_decode function
-        should be called.
-        """
-        y_org = y
-        y = y.view(-1, y.shape[-1])
-        shrink_fun: Callable = self._shrink_prefill if self.is_prefill else self._shrink_decode
-        shrink_fun(y, x, w_t_all, scale)
-        y = y.view_as(y_org)
-    
-    def add_shrink(
-            self,
-            y: tuple[torch.Tensor, ...] | torch.Tensor,
-            x: torch.Tensor,
-            lora_a_stacked: tuple[torch.Tensor, ...],
-            scale: float,
-            **kwargs,
-        ):
-        """
-        Performs GEMM  for multiple slices of lora_a.
-        When `is_prefill is` true, it indicates that it is currently the
-        prefill stage, and the `_shrink_prefill` function should be called.
-        Otherwise, it is the decode stage, and the _shrink_decode function
-        should be called.
-
-        Semantics:
-        for i in range(len(lora_a_stacked)):
-            y[i] += (x @ lora_a_stacked[i]) * scale
-
-        Args:
-            y (Union[Tuple[torch.Tensor, ...], torch.Tensor]): Output tensors
-            x (torch.Tensor): Input tensor
-            lora_a_stacked (Tuple[torch.Tensor, ...]): lora_a's weights
-            scale (float): Scaling factor for the operation
-        """
-        x = x.view(-1, x.shape[-1])
+        gmm_no_lora = self._use_gmm_cpu.logical_not()
         for slice_idx in range(len(lora_a_stacked)):
-            torch.ops.misha._shrink.default(
-                x, lora_a_stacked[slice_idx:slice_idx+1], y[slice_idx].unsqueeze(0),
+            torch.ops.lora.gmm_shrink(
+                x, lora_a_stacked[slice_idx],
+                y[slice_idx].view(-1, y[slice_idx].shape[-1]),
                 *self.prefill_metadata, scale,
-                self._triton_no_lora,
-                self._max_tiles_per_core,
+                gmm_no_lora,
             )
-            self.bgmv_shrink(x, lora_a_stacked[slice_idx], y[slice_idx],
-                             self._bgmv_indices, scale)
+            self.bgmv_shrink(
+                x, lora_a_stacked[slice_idx],
+                y[slice_idx].view(-1, y[slice_idx].shape[-1]),
+                bgmv_indices, scale,
+            )
 
     def add_expand(
         self,
@@ -529,147 +197,68 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         add_inputs=True,
         **kwargs,
     ) -> None:
-        """
-        Performs GEMM and bias addition for multiple slices of lora_b.
-
-        Semantics:
-            for i in range(len(lora_b_stacked)):
-                slice = output_slices[i]
-                y[:, offset:offset+slice] += x[i] @ lora_b_stacked[i] +
-                    lora_bias_stacked[i]
-                offset += slice
-
-        Args:
-            y (torch.Tensor): Output tensor.
-            x (Union[Tuple[torch.Tensor, ...], torch.Tensor]): Input tensors
-            lora_b_stacked (Tuple[torch.Tensor, ...]): lora_b's weight
-            lora_bias_stacked (Optional[Tuple[torch.Tensor, ...]]):
-                bias's weight
-            output_slices (Tuple[int, ...]): Every slice's size
-            add_inputs (bool):  Defaults to True.
-        """
         y_org = y
         y = y.view(-1, y.shape[-1])
+        n = y.shape[0]
+        bgmv_indices = torch.where(
+            self._use_gmm_device,
+            self._no_lora_indices[:n],
+            self._token_lora_indices[:n],
+        )
+        gmm_no_lora = self._use_gmm_cpu.logical_not()
         offset_left = offset_start
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
         for slice_idx in range(len(lora_b_stacked)):
-            self._apply_expand(
-                y,
-                x[slice_idx],
-                lora_b_stacked[slice_idx],
-                offset_left,
-                output_slices[slice_idx],
-                add_inputs=add_inputs,
+            torch.ops.lora.gmm_expand_slice(
+                y, x[slice_idx], lora_b_stacked[slice_idx],
+                *self.prefill_metadata,
+                offset_left, output_slices[slice_idx], add_inputs,
+                gmm_no_lora,
+            )
+            self.bgmv_expand_slice(
+                x[slice_idx], lora_b_stacked[slice_idx], y,
+                bgmv_indices, offset_left, output_slices[slice_idx], add_inputs,
             )
             offset_left += output_slices[slice_idx]
         y = y.view_as(y_org)
 
-    def add_lora_embedding(
-        self, y: torch.Tensor, x: torch.Tensor, lora_b_stacked: torch.Tensor, add_inputs: bool = True, **kwargs
-    ) -> None:
-        """
-        Applies lora  specifically for VocabParallelEmbeddingWithLoRA.
+    # --- kept for add_lora_embedding / add_lora_logits ---
 
-        Semantics:
-            y += x @ lora_b_stacked
+    def _expand_prefill(self, y, x, w_t_all, add_inputs):
+        if self.no_lora:
+            return
+        self.sgmv_expand(x, w_t_all, y, *self.prefill_metadata, add_inputs)
 
-        Args:
-            y (torch.Tensor): Output tensor.
-            x (torch.Tensor): Input tensor.
-            lora_b_stacked (torch.Tensor): lora_b's weights.
-            add_inputs (bool): Default to True.
-        """
+    def _expand_decode(self, y, x, w_t_all, add_inputs):
+        self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
 
-        # Embedding layer only need expand op
+    def add_lora_embedding(self, y, x, lora_b_stacked, add_inputs=True, **kwargs):
         expand_fun: Callable = self._expand_prefill if self.is_prefill else self._expand_decode
         x = x.to(torch.float32)
         expand_fun(y, x, lora_b_stacked, add_inputs)
 
-    def add_lora_linear(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        lora_a_stacked: tuple[torch.Tensor, ...],
-        lora_b_stacked: tuple[torch.Tensor, ...],
-        scale: float,
-        output_slices: tuple[int, ...],
-        *,
-        buffer: tuple[torch.Tensor, ...] | None = None,
-        **kwargs,
-    ) -> None:
-        """
-        Applicable to linear-related lora.
-
-        Semantics:
-            for i in range(len(lora_a_stacked)):
-                y[i] += (
-                    x[i].unsqueeze(0)
-                    @ lora_a_stacked[indices[i], layer_idx, :, :]
-                    @ lora_b_stacked[indices[i], layer_idx, :, :]
-                    * scale
-                    ).squeeze(0)+lora_bias_stacked[i]
-
-        Args:
-            y (torch.Tensor): Output tensor. Will be changed in-place.
-            x (torch.Tensor): Input tensor
-            lora_a_stacked (Tuple[torch.Tensor, ...]): lora_a's weight.
-            lora_b_stacked (Tuple[torch.Tensor, ...]): lora_b's weight.
-            lora_bias_stacked (Optional[Tuple[torch.Tensor, ...]]): lora's bias.
-            scale (float): Scaling factor.
-            output_slices (Tuple[int, ...]): Every slice's size.
-            buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
-        """
-
+    def add_lora_linear(self, y, x, lora_a_stacked, lora_b_stacked, scale,
+                        output_slices, *, buffer=None, **kwargs):
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
-
         if buffer is None:
             r = lora_b_stacked[0].size(-1)
-            # We set the buffer to be float32 by default, consistent with the
-            # triton op
             buffer = tuple(
-                torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device) for _ in range(len(output_slices))
+                torch.zeros((x.size(0), r), dtype=x.dtype, device=x.device)
+                for _ in range(len(output_slices))
             )
         self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y, buffer, lora_b_stacked, None, output_slices, add_inputs=True, **kwargs)
 
-    def add_lora_logits(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        lora_a_stacked: torch.Tensor,
-        lora_b_stacked: torch.Tensor,
-        scale,
-        *,
-        buffer: torch.Tensor | None = None,
-        **kwargs,
-    ) -> None:
-        """
-        Applies lora  specifically for LogitsProcessorWithLoRA.
-
-        Semantics:
-            buffer = (x @ lora_a_stacked) * scale
-            y += buffer @ lora_b_stacked
-
-        Args:
-            y (torch.Tensor): Output tensor.
-            x (torch.Tensor): Input tensor.
-            lora_a_stacked (torch.Tensor): lora_a's weights.
-            lora_b_stacked (torch.Tensor):lora_b's weights.
-            scale (float): Scaling factor.
-            buffer (Optional[torch.Tensor]):Default to None.
-        """
+    def add_lora_logits(self, y, x, lora_a_stacked, lora_b_stacked, scale,
+                        *, buffer=None, **kwargs):
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
         r = lora_b_stacked.size(-1)
-
         if buffer is None:
             buffer = torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
-
         indices = self.sampler_indices
-
         self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
         self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
-
         y = y.view_as(y_org)
