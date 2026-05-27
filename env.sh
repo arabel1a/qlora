@@ -30,10 +30,17 @@ export MAX_LORAS=2 # IMPORTANT! number of loras per batch can not exceed the num
 export MAX_LORA_RANK=32
 
 # benchmarks
-: "${NUM_PROMPTS:=256}"
+: "${NUM_PROMPTS:=80}"
 : "${RANDOM_INPUT_LEN:=2048}"
 : "${RANDOM_OUTPUT_LEN:=512}"
-: "${PARALLEL:=32}"
+: "${PARALLEL:=8}"
+
+WARMUP_PROMPTS_NUM=8
+MIN_PROMPT_LENGTH=2000
+MAX_PROMPT_LENGTH=7000
+MIN_GEN_TOKEN=2048
+MAX_GEN_TOKEN=2048
+
 # export DATASET="random"
 # export DATASET=./custom_dataset_qwen3_2000.jsonl
 : "${DATASET:=random_2056.jsonl}"
@@ -157,15 +164,22 @@ run_evalscope() {
         --parallel "$PARALLEL" \
         --model "$model_name" \
         --api openai \
+ 	--dataset random \
+	--seed 42 \
+	--tokenizer-path $MODEL\
+	--min-prompt-length $MIN_PROMPT_LENGTH \
+	--max-prompt-length $MAX_PROMPT_LENGTH \
+	--min-tokens $MIN_GEN_TOKEN \
+	--max-tokens $MAX_GEN_TOKEN \
         --url "$URL" \
-        --dataset custom \
-        --dataset-path "$DATASET" \
-        --max-tokens $RANDOM_OUTPUT_LEN \
-        --min-tokens $RANDOM_OUTPUT_LEN \
         --prefix-length 0 \
         --extra-args '{"ignore_eos": true}' \
         --outputs-dir "logs/${label}" \
         --rate -1
+	#         --dataset custom \
+	#         --dataset-path "$DATASET" \
+	#         --max-tokens $RANDOM_OUTPUT_LEN \
+	#        --min-tokens $RANDOM_OUTPUT_LEN \
 }
 
 benchmark() {
