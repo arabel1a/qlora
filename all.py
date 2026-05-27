@@ -306,7 +306,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if buffer is None:
             r = lora_b_stacked[0].size(-1)
             buffer = tuple(
-                torch.zeros((x.size(0), r), dtype=x.dtype, device=x.device)
+                torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
                 for _ in range(len(output_slices))
             )
         self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
