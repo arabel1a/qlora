@@ -9,6 +9,8 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
+_SGMV_SHRINK_FN = None
+_SGMV_EXPAND_SLICE_FN = None
 
 
 def _get_transposed_weight(w: torch.Tensor) -> torch.Tensor:
@@ -30,6 +32,8 @@ def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torc
     gathered = gathered.masked_fill(inactive, 0.0)
     return gathered
 
+
+# --- custom ops: opaque to torch.compile, safe to branch inside ---
 
 @torch.library.custom_op("lora::gmm_shrink", mutates_args=("output_tensor",))
 def _gmm_shrink_op(
@@ -63,6 +67,36 @@ def _gmm_shrink_op(
 def _gmm_shrink_fake(inputs, lora_a_weight, output_tensor,
                      b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
                      batch_size, max_length, token_nums, scaling, no_lora):
+    return None
+
+
+@torch.library.custom_op("lora::sgmv_shrink", mutates_args=("output_tensor",))
+def _sgmv_shrink_op(
+    inputs: torch.Tensor,
+    lora_a_weight: torch.Tensor,
+    output_tensor: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batch_size: int,
+    max_length: int,
+    token_nums: int,
+    scaling: float,
+    no_lora: torch.Tensor,
+) -> None:
+    if no_lora.item():
+        return
+    _SGMV_SHRINK_FN(
+        inputs, lora_a_weight, output_tensor,
+        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+        batch_size, max_length, token_nums, scaling,
+    )
+
+
+@_sgmv_shrink_op.register_fake
+def _sgmv_shrink_fake(inputs, lora_a_weight, output_tensor,
+                      b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+                      batch_size, max_length, token_nums, scaling, no_lora):
     return None
 
 
@@ -105,13 +139,47 @@ def _gmm_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
     return None
 
 
+@torch.library.custom_op("lora::sgmv_expand_slice", mutates_args=("y",))
+def _sgmv_expand_slice_op(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batch_size: int,
+    max_length: int,
+    token_nums: int,
+    y_offset: int,
+    y_slice_size: int,
+    add_inputs: bool,
+    no_lora: torch.Tensor,
+) -> None:
+    if no_lora.item():
+        return
+    _SGMV_EXPAND_SLICE_FN(
+        x, w, y,
+        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+        batch_size, max_length, token_nums,
+        y_offset, y_slice_size, add_inputs,
+    )
+
+
+@_sgmv_expand_slice_op.register_fake
+def _sgmv_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
+                            lora_indices_tensor, batch_size, max_length,
+                            token_nums, y_offset, y_slice_size, add_inputs, no_lora):
+    return None
+
+
 GMM_TOKEN_THRESHOLD = 1024
 
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
-    PunicaWrapperNPU: dual-launch gmm + bgmv.
-    gmm in custom_op with early-exit flag; bgmv disabled via all -1 indices.
+    PunicaWrapperNPU: dual-launch gmm + sgmv.
+    Both wrapped in custom_ops with early-exit flags (opaque to compile).
+    Prefill: gmm runs, sgmv disabled. Decode: sgmv runs, gmm disabled.
     """
 
     def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):
@@ -145,9 +213,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
-        self._no_lora_indices = torch.full(
-            (max_num_batched_tokens,), -1, dtype=torch.long, device=device,
-        )
+        global _SGMV_SHRINK_FN, _SGMV_EXPAND_SLICE_FN
+        _SGMV_SHRINK_FN = sgmv_shrink
+        _SGMV_EXPAND_SLICE_FN = sgmv_expand_slice
+
         self._use_gmm_device = torch.tensor(False, dtype=torch.bool, device=device)
         self._use_gmm_cpu = torch.tensor(False, dtype=torch.bool)
 
@@ -166,13 +235,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ):
         x = x.view(-1, x.shape[-1])
-        n = x.shape[0]
-        bgmv_indices = torch.where(
-            self._use_gmm_device,
-            self._no_lora_indices[:n],
-            self._token_lora_indices[:n],
-        )
         gmm_no_lora = self._use_gmm_cpu.logical_not()
+        sgmv_no_lora = self._use_gmm_cpu.clone()
         for slice_idx in range(len(lora_a_stacked)):
             torch.ops.lora.gmm_shrink(
                 x, lora_a_stacked[slice_idx],
@@ -180,10 +244,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 *self.prefill_metadata, scale,
                 gmm_no_lora,
             )
-            self.bgmv_shrink(
+            torch.ops.lora.sgmv_shrink(
                 x, lora_a_stacked[slice_idx],
                 y[slice_idx].view(-1, y[slice_idx].shape[-1]),
-                bgmv_indices, scale,
+                *self.prefill_metadata, scale,
+                sgmv_no_lora,
             )
 
     def add_expand(
@@ -199,13 +264,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     ) -> None:
         y_org = y
         y = y.view(-1, y.shape[-1])
-        n = y.shape[0]
-        bgmv_indices = torch.where(
-            self._use_gmm_device,
-            self._no_lora_indices[:n],
-            self._token_lora_indices[:n],
-        )
         gmm_no_lora = self._use_gmm_cpu.logical_not()
+        sgmv_no_lora = self._use_gmm_cpu.clone()
         offset_left = offset_start
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
@@ -216,9 +276,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 offset_left, output_slices[slice_idx], add_inputs,
                 gmm_no_lora,
             )
-            self.bgmv_expand_slice(
-                x[slice_idx], lora_b_stacked[slice_idx], y,
-                bgmv_indices, offset_left, output_slices[slice_idx], add_inputs,
+            torch.ops.lora.sgmv_expand_slice(
+                y, x[slice_idx], lora_b_stacked[slice_idx],
+                *self.prefill_metadata,
+                offset_left, output_slices[slice_idx], add_inputs,
+                sgmv_no_lora,
             )
             offset_left += output_slices[slice_idx]
         y = y.view_as(y_org)
