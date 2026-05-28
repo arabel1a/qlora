@@ -7,6 +7,7 @@ from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+print("\nhui"*10)
 
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 _SGMV_SHRINK_FN = None
@@ -218,14 +219,16 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         _SGMV_SHRINK_FN = sgmv_shrink
         _SGMV_EXPAND_SLICE_FN = sgmv_expand_slice
 
-        self._use_gmm_device = torch.tensor(False, dtype=torch.bool, device=device)
-        self._use_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+        # self._use_gmm_device = torch.tensor(False, dtype=torch.bool, device=device)
+        self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
+        self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
         val = self.token_nums > GMM_TOKEN_THRESHOLD
-        self._use_gmm_device.fill_(val)
-        self._use_gmm_cpu.fill_(val)
+        # self._use_gmm_device.fill_(val)
+        self._use_gmm_expand_cpu.fill_(False)
+        self._use_gmm_shrink_cpu.fill_(False)
 
     def add_shrink(
         self,
@@ -236,8 +239,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ):
         x = x.view(-1, x.shape[-1])
-        gmm_no_lora = self._use_gmm_cpu.logical_not()
-        sgmv_no_lora = self._use_gmm_cpu.clone()
+        gmm_no_lora = self._use_gmm_shrink_cpu.logical_not()
+        sgmv_no_lora = self._use_gmm_shrink_cpu.clone()
         for slice_idx in range(len(lora_a_stacked)):
             torch.ops.lora.gmm_shrink(
                 x, lora_a_stacked[slice_idx],
@@ -265,8 +268,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     ) -> None:
         y_org = y
         y = y.view(-1, y.shape[-1])
-        gmm_no_lora = self._use_gmm_cpu.logical_not()
-        sgmv_no_lora = self._use_gmm_cpu.clone()
+        gmm_no_lora = self._use_gmm_expand_cpu.logical_not()
+        sgmv_no_lora = self._use_gmm_expand_cpu.clone()
         offset_left = offset_start
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
