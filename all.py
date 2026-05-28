@@ -119,9 +119,10 @@ def _gmm_expand_slice_op(
     if no_lora.item():
         return
     gathered_w = _gather_weights_for_gmm(w, lora_indices_tensor)
-    x_in = x if x.dtype == gathered_w.dtype else x.to(gathered_w.dtype)
+    # Cast weights up to match x (fp32 from shrink), not x down to bf16
+    w_in = gathered_w if gathered_w.dtype == x.dtype else gathered_w.to(x.dtype)
     result = torch_npu.npu_grouped_matmul(
-        x=[x_in], weight=[gathered_w],
+        x=[x], weight=[w_in],
         split_item=2, group_list_type=1, group_type=0,
         group_list=seq_len_tensor,
     )[0]
