@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from typing import List
 
@@ -9,26 +10,31 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 print("\nhui"*10)
 
+# Back-compat shim: test_e2e.py references this. No longer used as a cache —
+# see _gather_weights_for_gmm for why caching the transpose was unsafe.
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 _SGMV_SHRINK_FN = None
 _SGMV_EXPAND_SLICE_FN = None
 
 
-def _get_transposed_weight(w: torch.Tensor) -> torch.Tensor:
-    key = w.data_ptr()
-    if (cached := _TRANSPOSED_WEIGHT_CACHE.get(key)) is not None:
-        return cached
-    if w.ndim == 4:
-        w = w.squeeze(1)
-    w_t = w.transpose(1, 2).contiguous()
-    _TRANSPOSED_WEIGHT_CACHE[key] = w_t
-    return w_t
-
-
 def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torch.Tensor:
-    w_t = _get_transposed_weight(w)
+    # IMPORTANT: do not cache the transposed weight by w.data_ptr(). The stacked
+    # LoRA weight buffers are allocated up front (zeros) and the adapter weights
+    # are copied into the *same* storage later. A data_ptr-keyed cache populated
+    # during the zero-init / warmup pass returns a STALE all-zeros transpose once
+    # the real adapter loads -> the gmm LoRA delta becomes exactly 0 (output ==
+    # base). sgmv reads the live buffer and is unaffected, which is why only the
+    # gmm path silently dropped the LoRA.
+    #
+    # Gather by index first (per-group, small), then transpose the gathered
+    # result. Gathering on dim 0 commutes with transpose(1, 2), so this is
+    # identical to transpose-then-gather but avoids transposing the full stacked
+    # weight and reads the live buffer every call.
+    if w.ndim == 4:
+        w = w.squeeze(1)                              # [num_slots, rank, hidden]
     safe_indices = lora_indices.clamp(min=0)
-    gathered = w_t[safe_indices]
+    gathered = w[safe_indices]                        # [num_groups, rank, hidden]
+    gathered = gathered.transpose(1, 2).contiguous()  # [num_groups, hidden, rank]
     inactive = (lora_indices < 0).unsqueeze(1).unsqueeze(2)
     gathered = gathered.masked_fill(inactive, 0.0)
     return gathered
@@ -176,6 +182,12 @@ def _sgmv_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
 
 GMM_TOKEN_THRESHOLD = 1024
 
+# Runtime gate for the gmm path (debugging the gmm accuracy regression).
+#   off       -> gmm disabled, pure sgmv (committed-safe default, =97% acc)
+#   threshold -> gmm on when token_nums > GMM_TOKEN_THRESHOLD (the prod regime)
+#   force     -> gmm on for every batch (decode too) so it can be tested on short prompts
+_GMM_MODE = os.environ.get("LORA_GMM", "off").lower()
+
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
@@ -225,10 +237,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
-        val = self.token_nums > GMM_TOKEN_THRESHOLD
-        # self._use_gmm_device.fill_(val)
-        self._use_gmm_expand_cpu.fill_(False)
-        self._use_gmm_shrink_cpu.fill_(False)
+        if _GMM_MODE == "force":
+            enabled = True
+        elif _GMM_MODE == "threshold":
+            enabled = bool(self.token_nums > GMM_TOKEN_THRESHOLD)
+        else:
+            enabled = False
+        # self._use_gmm_device.fill_(enabled)
+        self._use_gmm_expand_cpu.fill_(enabled)
+        self._use_gmm_shrink_cpu.fill_(enabled)
 
     def add_shrink(
         self,
