@@ -10,11 +10,55 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 print("\nhui"*10)
 
+# --- TEMP debug trace (compile/decode routing investigation) ---
+_TRACE = os.environ.get("LORA_TRACE", "") != ""
+_TRACE_PATH = os.environ.get("LORA_TRACE_PATH", "/tmp/lora_trace.log")
+_trace_n = [0]
+
+
+def _trace(tag: str, **kv):
+    if not _TRACE:
+        return
+    _trace_n[0] += 1
+    parts = " ".join(f"{k}={v}" for k, v in kv.items())
+    try:
+        with open(_TRACE_PATH, "a") as f:
+            f.write(f"[{_trace_n[0]:05d}] {tag} {parts}\n")
+    except Exception:
+        pass
+
+
 # Back-compat shim: test_e2e.py references this. No longer used as a cache —
 # see _gather_weights_for_gmm for why caching the transpose was unsafe.
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 _SGMV_SHRINK_FN = None
 _SGMV_EXPAND_SLICE_FN = None
+
+
+def _sanitize_group_list(seq_len_tensor: torch.Tensor, num_rows: int) -> torch.Tensor:
+    # Under torch.compile the punica metadata slices are baked at trace time
+    # (sliced by the trace-time batch_size, e.g. 256 from the warmup run), so at
+    # runtime seq_len_tensor carries STALE counts past the live batch: e.g.
+    # [2019, 32, 32, ...] for a single 2019-token prefill. The ascend sgmv
+    # kernel tolerates the garbage tail; npu_grouped_matmul does not —
+    # sum(group_list) overshoots the actual row count and the kernel reads/
+    # writes out of bounds -> garbage output. Zero every group whose cumulative
+    # count exceeds the real number of input rows. Pure tensor ops, no
+    # device->host sync, so this is also legal under aclgraph capture.
+    csum = torch.cumsum(seq_len_tensor, dim=0)
+    valid = csum <= num_rows
+    return seq_len_tensor * valid
+
+
+def _stream_is_capturing() -> bool:
+    # npu_grouped_matmul is not aclgraph-safe (data-dependent group_list; crashes
+    # or corrupts under capture/replay). If this op body runs while the current
+    # stream is being captured into an ACL graph, the graph must record the sgmv
+    # kernels instead — sgmv under capture is verified correct.
+    try:
+        return torch.npu.is_current_stream_capturing()
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torch.Tensor:
@@ -56,14 +100,25 @@ def _gmm_shrink_op(
     scaling: float,
     no_lora: torch.Tensor,
 ) -> None:
+    _trace("gmm_shrink", no_lora=no_lora.item(), tok=int(inputs.shape[0]),
+           tn=token_nums, cap=_stream_is_capturing(),
+           sl=tuple(seq_len_tensor.shape))
     if no_lora.item():
+        return
+    if _stream_is_capturing():
+        _SGMV_SHRINK_FN(
+            inputs, lora_a_weight, output_tensor,
+            b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+            batch_size, max_length, token_nums, scaling,
+        )
         return
     gathered_w = _gather_weights_for_gmm(lora_a_weight, lora_indices_tensor)
     x_in = inputs if inputs.dtype == gathered_w.dtype else inputs.to(gathered_w.dtype)
+    group_list = _sanitize_group_list(seq_len_tensor, inputs.shape[0])
     result = torch_npu.npu_grouped_matmul(
         x=[x_in], weight=[gathered_w],
         split_item=2, group_list_type=1, group_type=0,
-        group_list=seq_len_tensor,
+        group_list=group_list,
     )[0]
     if scaling != 1.0:
         result = result * scaling
@@ -91,6 +146,8 @@ def _sgmv_shrink_op(
     scaling: float,
     no_lora: torch.Tensor,
 ) -> None:
+    _trace("sgmv_shrink", no_lora=no_lora.item(), tok=int(inputs.shape[0]),
+           tn=token_nums)
     if no_lora.item():
         return
     _SGMV_SHRINK_FN(
@@ -123,15 +180,27 @@ def _gmm_expand_slice_op(
     add_inputs: bool,
     no_lora: torch.Tensor,
 ) -> None:
+    _trace("gmm_expand", no_lora=no_lora.item(), tok=int(x.shape[0]),
+           tn=token_nums, cap=_stream_is_capturing(),
+           sl=tuple(seq_len_tensor.shape))
     if no_lora.item():
+        return
+    if _stream_is_capturing():
+        _SGMV_EXPAND_SLICE_FN(
+            x, w, y,
+            b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+            batch_size, max_length, token_nums,
+            y_offset, y_slice_size, add_inputs,
+        )
         return
     gathered_w = _gather_weights_for_gmm(w, lora_indices_tensor)
     # Cast weights up to match x (fp32 from shrink), not x down to bf16
     w_in = gathered_w if gathered_w.dtype == x.dtype else gathered_w.to(x.dtype)
+    group_list = _sanitize_group_list(seq_len_tensor, x.shape[0])
     result = torch_npu.npu_grouped_matmul(
         x=[x], weight=[w_in],
         split_item=2, group_list_type=1, group_type=0,
-        group_list=seq_len_tensor,
+        group_list=group_list,
     )[0]
     target = y[:, y_offset:y_offset + y_slice_size]
     if add_inputs:
@@ -163,6 +232,8 @@ def _sgmv_expand_slice_op(
     add_inputs: bool,
     no_lora: torch.Tensor,
 ) -> None:
+    _trace("sgmv_expand", no_lora=no_lora.item(), tok=int(x.shape[0]),
+           tn=token_nums)
     if no_lora.item():
         return
     _SGMV_EXPAND_SLICE_FN(
@@ -246,6 +317,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # self._use_gmm_device.fill_(enabled)
         self._use_gmm_expand_cpu.fill_(enabled)
         self._use_gmm_shrink_cpu.fill_(enabled)
+        _trace("update_metadata", is_prefill=getattr(self, "is_prefill", "?"),
+               tn=self.token_nums, enabled=enabled, bsz=self.batch_size)
 
     def add_shrink(
         self,

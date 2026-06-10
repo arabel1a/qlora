@@ -39,6 +39,11 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--long", action="store_true",
                     help="use one long (>1024 tok) prompt so threshold-mode gmm fires in prefill")
+    ap.add_argument("--cudagraph-mode", default=None,
+                    help="NONE|PIECEWISE|FULL|... -> compilation_config.cudagraph_mode "
+                         "(NONE = torch.compile ON but aclgraph OFF, to isolate capture vs inductor)")
+    ap.add_argument("--no-specialize-lora", action="store_true",
+                    help="set compilation_config.cudagraph_specialize_lora=False")
     args = ap.parse_args()
 
     global PROMPTS
@@ -50,6 +55,14 @@ def main():
     mode = "compiled" if not args.eager else "eager"
     tag = f"gmm={gmm_mode}/{mode}"
 
+    comp_cfg = {}
+    if args.cudagraph_mode is not None:
+        comp_cfg["cudagraph_mode"] = args.cudagraph_mode
+        tag += f"/cg={args.cudagraph_mode}"
+    if args.no_specialize_lora:
+        comp_cfg["cudagraph_specialize_lora"] = False
+        tag += "/nospec"
+
     llm = LLM(
         model=MODEL,
         enable_lora=True,
@@ -59,6 +72,7 @@ def main():
         enforce_eager=args.eager,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.6,
+        compilation_config=(comp_cfg or None),
     )
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
