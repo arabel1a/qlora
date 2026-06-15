@@ -8,57 +8,11 @@ from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-print("\nhui"*10)
-
-# --- TEMP debug trace (compile/decode routing investigation) ---
-_TRACE = os.environ.get("LORA_TRACE", "") != ""
-_TRACE_PATH = os.environ.get("LORA_TRACE_PATH", "/tmp/lora_trace.log")
-_trace_n = [0]
-
-
-def _trace(tag: str, **kv):
-    if not _TRACE:
-        return
-    _trace_n[0] += 1
-    parts = " ".join(f"{k}={v}" for k, v in kv.items())
-    try:
-        with open(_TRACE_PATH, "a") as f:
-            f.write(f"[{_trace_n[0]:05d}] {tag} {parts}\n")
-    except Exception:
-        pass
-
-
 # Back-compat shim: test_e2e.py references this. No longer used as a cache —
 # see _gather_weights_for_gmm for why caching the transpose was unsafe.
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 _SGMV_SHRINK_FN = None
 _SGMV_EXPAND_SLICE_FN = None
-
-
-def _sanitize_group_list(seq_len_tensor: torch.Tensor, num_rows: int) -> torch.Tensor:
-    # Under torch.compile the punica metadata slices are baked at trace time
-    # (sliced by the trace-time batch_size, e.g. 256 from the warmup run), so at
-    # runtime seq_len_tensor carries STALE counts past the live batch: e.g.
-    # [2019, 32, 32, ...] for a single 2019-token prefill. The ascend sgmv
-    # kernel tolerates the garbage tail; npu_grouped_matmul does not —
-    # sum(group_list) overshoots the actual row count and the kernel reads/
-    # writes out of bounds -> garbage output. Zero every group whose cumulative
-    # count exceeds the real number of input rows. Pure tensor ops, no
-    # device->host sync, so this is also legal under aclgraph capture.
-    csum = torch.cumsum(seq_len_tensor, dim=0)
-    valid = csum <= num_rows
-    return seq_len_tensor * valid
-
-
-def _stream_is_capturing() -> bool:
-    # npu_grouped_matmul is not aclgraph-safe (data-dependent group_list; crashes
-    # or corrupts under capture/replay). If this op body runs while the current
-    # stream is being captured into an ACL graph, the graph must record the sgmv
-    # kernels instead — sgmv under capture is verified correct.
-    try:
-        return torch.npu.is_current_stream_capturing()
-    except (AttributeError, RuntimeError):
-        return False
 
 
 def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torch.Tensor:
@@ -84,176 +38,130 @@ def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torc
     return gathered
 
 
-# --- custom ops: opaque to torch.compile, safe to branch inside ---
+# --- custom ops: each wraps a WHOLE add_* call as one opaque operator ---
+#
+# Why one combined op per add_* instead of the old per-slice dual-launch of
+# separate gmm_* and sgmv_* ops: under torch.compile the custom-op body is
+# OPAQUE. Inductor never traces into it, so it cannot constant-fold the kernel
+# choice away nor reorder/fuse the two kernels, and the slice loop + the
+# gmm-vs-sgmv branch run as live Python at runtime. The switch is driven by two
+# CPU bool tensors passed as op inputs:
+#   use_gmm  -> gmm (npu_grouped_matmul, prefill) vs sgmv (decode)
+#   no_lora  -> short-circuit when no adapter is active in the batch
+# Reading them with .item() is a host-side load (no device->host sync, so it is
+# legal under ACL-graph capture) and, being tensor inputs rather than Python
+# constants, their values are NOT baked into the FX graph at trace time. A
+# single op also mutates the output buffer exactly once, instead of two ops
+# aliasing the same buffer (which functionalization handles poorly).
 
-@torch.library.custom_op("lora::gmm_shrink", mutates_args=("output_tensor",))
-def _gmm_shrink_op(
-    inputs: torch.Tensor,
-    lora_a_weight: torch.Tensor,
-    output_tensor: torch.Tensor,
-    b_seq_start_loc: torch.Tensor,
-    seq_len_tensor: torch.Tensor,
-    lora_indices_tensor: torch.Tensor,
-    batch_size: int,
-    max_length: int,
-    token_nums: int,
-    scaling: float,
-    no_lora: torch.Tensor,
-) -> None:
-    _trace("gmm_shrink", no_lora=no_lora.item(), tok=int(inputs.shape[0]),
-           tn=token_nums, cap=_stream_is_capturing(),
-           sl=tuple(seq_len_tensor.shape))
-    if no_lora.item():
-        return
-    if _stream_is_capturing():
-        _SGMV_SHRINK_FN(
-            inputs, lora_a_weight, output_tensor,
-            b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-            batch_size, max_length, token_nums, scaling,
-        )
-        return
-    gathered_w = _gather_weights_for_gmm(lora_a_weight, lora_indices_tensor)
-    x_in = inputs if inputs.dtype == gathered_w.dtype else inputs.to(gathered_w.dtype)
-    group_list = _sanitize_group_list(seq_len_tensor, inputs.shape[0])
-    result = torch_npu.npu_grouped_matmul(
-        x=[x_in], weight=[gathered_w],
-        split_item=2, group_list_type=1, group_type=0,
-        group_list=group_list,
-    )[0]
-    if scaling != 1.0:
-        result = result * scaling
-    output_tensor.add_(result.to(output_tensor.dtype))
-
-
-@_gmm_shrink_op.register_fake
-def _gmm_shrink_fake(inputs, lora_a_weight, output_tensor,
-                     b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-                     batch_size, max_length, token_nums, scaling, no_lora):
-    return None
-
-
-@torch.library.custom_op("lora::sgmv_shrink", mutates_args=("output_tensor",))
-def _sgmv_shrink_op(
-    inputs: torch.Tensor,
-    lora_a_weight: torch.Tensor,
-    output_tensor: torch.Tensor,
-    b_seq_start_loc: torch.Tensor,
-    seq_len_tensor: torch.Tensor,
-    lora_indices_tensor: torch.Tensor,
-    batch_size: int,
-    max_length: int,
-    token_nums: int,
-    scaling: float,
-    no_lora: torch.Tensor,
-) -> None:
-    _trace("sgmv_shrink", no_lora=no_lora.item(), tok=int(inputs.shape[0]),
-           tn=token_nums)
-    if no_lora.item():
-        return
-    _SGMV_SHRINK_FN(
-        inputs, lora_a_weight, output_tensor,
-        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-        batch_size, max_length, token_nums, scaling,
-    )
-
-
-@_sgmv_shrink_op.register_fake
-def _sgmv_shrink_fake(inputs, lora_a_weight, output_tensor,
-                      b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-                      batch_size, max_length, token_nums, scaling, no_lora):
-    return None
-
-
-@torch.library.custom_op("lora::gmm_expand_slice", mutates_args=("y",))
-def _gmm_expand_slice_op(
-    y: torch.Tensor,
+@torch.library.custom_op("lora::add_shrink", mutates_args=("y",))
+def _add_shrink_op(
+    y: List[torch.Tensor],
     x: torch.Tensor,
-    w: torch.Tensor,
+    lora_a_stacked: List[torch.Tensor],
     b_seq_start_loc: torch.Tensor,
     seq_len_tensor: torch.Tensor,
     lora_indices_tensor: torch.Tensor,
     batch_size: int,
     max_length: int,
     token_nums: int,
-    y_offset: int,
-    y_slice_size: int,
-    add_inputs: bool,
+    scaling: float,
+    use_gmm: torch.Tensor,
     no_lora: torch.Tensor,
 ) -> None:
-    _trace("gmm_expand", no_lora=no_lora.item(), tok=int(x.shape[0]),
-           tn=token_nums, cap=_stream_is_capturing(),
-           sl=tuple(seq_len_tensor.shape))
     if no_lora.item():
         return
-    if _stream_is_capturing():
-        _SGMV_EXPAND_SLICE_FN(
-            x, w, y,
-            b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-            batch_size, max_length, token_nums,
-            y_offset, y_slice_size, add_inputs,
-        )
-        return
-    gathered_w = _gather_weights_for_gmm(w, lora_indices_tensor)
-    # Cast weights up to match x (fp32 from shrink), not x down to bf16
-    w_in = gathered_w if gathered_w.dtype == x.dtype else gathered_w.to(x.dtype)
-    group_list = _sanitize_group_list(seq_len_tensor, x.shape[0])
-    result = torch_npu.npu_grouped_matmul(
-        x=[x], weight=[w_in],
-        split_item=2, group_list_type=1, group_type=0,
-        group_list=group_list,
-    )[0]
-    target = y[:, y_offset:y_offset + y_slice_size]
-    if add_inputs:
-        target.add_(result.to(target.dtype))
+    if use_gmm.item():
+        for slice_idx in range(len(lora_a_stacked)):
+            out = y[slice_idx]
+            gathered_w = _gather_weights_for_gmm(
+                lora_a_stacked[slice_idx], lora_indices_tensor)
+            x_in = x if x.dtype == gathered_w.dtype else x.to(gathered_w.dtype)
+            result = torch_npu.npu_grouped_matmul(
+                x=[x_in], weight=[gathered_w],
+                split_item=2, group_list_type=1, group_type=0,
+                group_list=seq_len_tensor,
+            )[0]
+            if scaling != 1.0:
+                result = result * scaling
+            out.add_(result.to(out.dtype))
     else:
-        target.copy_(result.to(target.dtype))
+        for slice_idx in range(len(lora_a_stacked)):
+            _SGMV_SHRINK_FN(
+                x, lora_a_stacked[slice_idx], y[slice_idx],
+                b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+                batch_size, max_length, token_nums, scaling,
+            )
 
 
-@_gmm_expand_slice_op.register_fake
-def _gmm_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
-                           lora_indices_tensor, batch_size, max_length,
-                           token_nums, y_offset, y_slice_size, add_inputs, no_lora):
+@_add_shrink_op.register_fake
+def _add_shrink_fake(y, x, lora_a_stacked, b_seq_start_loc, seq_len_tensor,
+                     lora_indices_tensor, batch_size, max_length, token_nums,
+                     scaling, use_gmm, no_lora):
     return None
 
 
-@torch.library.custom_op("lora::sgmv_expand_slice", mutates_args=("y",))
-def _sgmv_expand_slice_op(
+@torch.library.custom_op("lora::add_expand", mutates_args=("y",))
+def _add_expand_op(
     y: torch.Tensor,
-    x: torch.Tensor,
-    w: torch.Tensor,
+    x: List[torch.Tensor],
+    lora_b_stacked: List[torch.Tensor],
     b_seq_start_loc: torch.Tensor,
     seq_len_tensor: torch.Tensor,
     lora_indices_tensor: torch.Tensor,
     batch_size: int,
     max_length: int,
     token_nums: int,
-    y_offset: int,
-    y_slice_size: int,
+    output_slices: List[int],
+    offset_start: int,
     add_inputs: bool,
+    use_gmm: torch.Tensor,
     no_lora: torch.Tensor,
 ) -> None:
-    _trace("sgmv_expand", no_lora=no_lora.item(), tok=int(x.shape[0]),
-           tn=token_nums)
     if no_lora.item():
         return
-    _SGMV_EXPAND_SLICE_FN(
-        x, w, y,
-        b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-        batch_size, max_length, token_nums,
-        y_offset, y_slice_size, add_inputs,
-    )
+    offset_left = offset_start
+    if use_gmm.item():
+        for slice_idx in range(len(lora_b_stacked)):
+            xi = x[slice_idx]
+            size = output_slices[slice_idx]
+            gathered_w = _gather_weights_for_gmm(
+                lora_b_stacked[slice_idx], lora_indices_tensor)
+            # Cast weights up to match x (fp32 from shrink), not x down to bf16
+            w_in = gathered_w if gathered_w.dtype == xi.dtype else gathered_w.to(xi.dtype)
+            result = torch_npu.npu_grouped_matmul(
+                x=[xi], weight=[w_in],
+                split_item=2, group_list_type=1, group_type=0,
+                group_list=seq_len_tensor,
+            )[0]
+            target = y[:, offset_left:offset_left + size]
+            if add_inputs:
+                target.add_(result.to(target.dtype))
+            else:
+                target.copy_(result.to(target.dtype))
+            offset_left += size
+    else:
+        for slice_idx in range(len(lora_b_stacked)):
+            size = output_slices[slice_idx]
+            _SGMV_EXPAND_SLICE_FN(
+                x[slice_idx], lora_b_stacked[slice_idx], y,
+                b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
+                batch_size, max_length, token_nums,
+                offset_left, size, add_inputs,
+            )
+            offset_left += size
 
 
-@_sgmv_expand_slice_op.register_fake
-def _sgmv_expand_slice_fake(y, x, w, b_seq_start_loc, seq_len_tensor,
-                            lora_indices_tensor, batch_size, max_length,
-                            token_nums, y_offset, y_slice_size, add_inputs, no_lora):
+@_add_expand_op.register_fake
+def _add_expand_fake(y, x, lora_b_stacked, b_seq_start_loc, seq_len_tensor,
+                     lora_indices_tensor, batch_size, max_length, token_nums,
+                     output_slices, offset_start, add_inputs, use_gmm, no_lora):
     return None
 
 
 GMM_TOKEN_THRESHOLD = 1024
 
-# Runtime gate for the gmm path (debugging the gmm accuracy regression).
+# Runtime gate for the gmm path.
 #   off       -> gmm disabled, pure sgmv (committed-safe default, =97% acc)
 #   threshold -> gmm on when token_nums > GMM_TOKEN_THRESHOLD (the prod regime)
 #   force     -> gmm on for every batch (decode too) so it can be tested on short prompts
@@ -262,9 +170,13 @@ _GMM_MODE = os.environ.get("LORA_GMM", "off").lower()
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
-    PunicaWrapperNPU: dual-launch gmm + sgmv.
-    Both wrapped in custom_ops with early-exit flags (opaque to compile).
-    Prefill: gmm runs, sgmv disabled. Decode: sgmv runs, gmm disabled.
+    PunicaWrapperNPU: gmm (npu_grouped_matmul) for prefill, sgmv for decode.
+
+    add_shrink / add_expand are each wrapped in a SINGLE opaque custom op that
+    branches gmm-vs-sgmv on a CPU bool flag (use_gmm) and short-circuits on a
+    no_lora CPU flag. Being opaque, the choice survives torch.compile: the op is
+    never traced into nor constant-folded, and the flags are read live at
+    runtime from CPU tensors (host read, no device sync -> aclgraph-safe).
     """
 
     def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):
@@ -302,9 +214,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         _SGMV_SHRINK_FN = sgmv_shrink
         _SGMV_EXPAND_SLICE_FN = sgmv_expand_slice
 
-        # self._use_gmm_device = torch.tensor(False, dtype=torch.bool, device=device)
+        # gmm-vs-sgmv switch (set per batch in update_metadata). CPU tensors so
+        # the opaque ops can read them with .item() without a device->host sync.
         self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
         self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
+        # no-lora short-circuit. Default True (skip) until metadata says a lora
+        # is active, mirroring upstream's `if self.no_lora: return` fast path.
+        self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
@@ -314,11 +230,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             enabled = bool(self.token_nums > GMM_TOKEN_THRESHOLD)
         else:
             enabled = False
-        # self._use_gmm_device.fill_(enabled)
         self._use_gmm_expand_cpu.fill_(enabled)
         self._use_gmm_shrink_cpu.fill_(enabled)
-        _trace("update_metadata", is_prefill=getattr(self, "is_prefill", "?"),
-               tn=self.token_nums, enabled=enabled, bsz=self.batch_size)
+        self._no_lora_cpu.fill_(bool(self.no_lora))
 
     def add_shrink(
         self,
@@ -329,21 +243,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ):
         x = x.view(-1, x.shape[-1])
-        gmm_no_lora = self._use_gmm_shrink_cpu.logical_not()
-        sgmv_no_lora = self._use_gmm_shrink_cpu.clone()
-        for slice_idx in range(len(lora_a_stacked)):
-            torch.ops.lora.gmm_shrink(
-                x, lora_a_stacked[slice_idx],
-                y[slice_idx].view(-1, y[slice_idx].shape[-1]),
-                *self.prefill_metadata, scale,
-                gmm_no_lora,
-            )
-            torch.ops.lora.sgmv_shrink(
-                x, lora_a_stacked[slice_idx],
-                y[slice_idx].view(-1, y[slice_idx].shape[-1]),
-                *self.prefill_metadata, scale,
-                sgmv_no_lora,
-            )
+        y_views = [y[i].view(-1, y[i].shape[-1]) for i in range(len(lora_a_stacked))]
+        torch.ops.lora.add_shrink(
+            y_views, x, list(lora_a_stacked),
+            *self.prefill_metadata, scale,
+            self._use_gmm_shrink_cpu, self._no_lora_cpu,
+        )
 
     def add_expand(
         self,
@@ -358,25 +263,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     ) -> None:
         y_org = y
         y = y.view(-1, y.shape[-1])
-        gmm_no_lora = self._use_gmm_expand_cpu.logical_not()
-        sgmv_no_lora = self._use_gmm_expand_cpu.clone()
-        offset_left = offset_start
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
-        for slice_idx in range(len(lora_b_stacked)):
-            torch.ops.lora.gmm_expand_slice(
-                y, x[slice_idx], lora_b_stacked[slice_idx],
-                *self.prefill_metadata,
-                offset_left, output_slices[slice_idx], add_inputs,
-                gmm_no_lora,
-            )
-            torch.ops.lora.sgmv_expand_slice(
-                y, x[slice_idx], lora_b_stacked[slice_idx],
-                *self.prefill_metadata,
-                offset_left, output_slices[slice_idx], add_inputs,
-                sgmv_no_lora,
-            )
-            offset_left += output_slices[slice_idx]
+        torch.ops.lora.add_expand(
+            y, [x[i] for i in range(len(lora_b_stacked))], list(lora_b_stacked),
+            *self.prefill_metadata,
+            list(output_slices), offset_start, add_inputs,
+            self._use_gmm_expand_cpu, self._no_lora_cpu,
+        )
         y = y.view_as(y_org)
 
     # --- kept for add_lora_embedding / add_lora_logits ---
