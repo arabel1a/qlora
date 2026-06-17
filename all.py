@@ -231,18 +231,39 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # no-lora short-circuit. Default True (skip) until metadata says a lora
         # is active, mirroring upstream's `if self.no_lora: return` fast path.
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
+        # whether compute_meta (prefill_metadata) was computed this step
+        self._prefill_meta_ready = False
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
-        super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
+        # Base metadata (token_lora_indices) is needed by the bgmv decode path and is
+        # cheap (no device->host syncs). compute_meta (prefill_metadata) is needed ONLY
+        # by the gmm prefill path and costs TWO syncs (.max().item()+.sum().item()), so
+        # we skip it on decode. token_num / no_lora come from the host mapping (no sync).
+        self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        token_num = len(mapping.index_mapping)
         if _GMM_MODE == "force":
             enabled = True
         elif _GMM_MODE == "threshold":
-            enabled = bool(self.token_nums > GMM_TOKEN_THRESHOLD)
+            enabled = token_num > GMM_TOKEN_THRESHOLD
         else:
             enabled = False
+        if enabled:
+            # prefill/gmm: compute seq_len + lora_indices (+ no_lora) via compute_meta;
+            # the 2 syncs are amortized over a large (>threshold) batch.
+            self._update_prefill_metadata(self.token_lora_indices)
+            no_lora = bool(self.no_lora)
+        else:
+            # decode/bgmv: skip compute_meta entirely. no_lora from the host mapping
+            # (index_mapping uses 0 for no-lora). add_shrink/add_expand still pass
+            # prefill_metadata's lora_indices/seq_len but the bgmv branch ignores them.
+            no_lora = not any(mapping.index_mapping)
         self._use_gmm_expand_cpu.fill_(enabled)
         self._use_gmm_shrink_cpu.fill_(enabled)
-        self._no_lora_cpu.fill_(bool(self.no_lora))
+        self._no_lora_cpu.fill_(no_lora)
+        # prefill_metadata is only valid when we ran compute_meta (enabled). Consumers
+        # that use it (add_lora_embedding's sgmv path) must fall back to bgmv otherwise.
+        self._prefill_meta_ready = enabled
+        self.is_prefill = bool(getattr(mapping, "is_prefill", True))
 
     def add_shrink(
         self,
@@ -296,7 +317,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
 
     def add_lora_embedding(self, y, x, lora_b_stacked, add_inputs=True, **kwargs):
-        expand_fun: Callable = self._expand_prefill if self.is_prefill else self._expand_decode
+        # Use the sgmv prefill path only when prefill_metadata was actually computed
+        # this step; on a metadata-stripped decode step fall back to bgmv (per-token).
+        expand_fun: Callable = self._expand_prefill if self._prefill_meta_ready else self._expand_decode
         x = x.to(torch.float32)
         expand_fun(y, x, lora_b_stacked, add_inputs)
 
