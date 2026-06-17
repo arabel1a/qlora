@@ -14,6 +14,9 @@
 #   all.py                   -> vllm_ascend/lora/punica_npu.py (calls torch.ops._C_ascend.add_lora_*)
 #
 # Revert: ./build_op.sh revert   (restores stock csrc via git + the backed-up .so, redeploys stock punica)
+#
+# Portable: uses only ssh + scp (no rsync), so it runs in Windows git-bash / WSL too,
+# where the bundled OpenSSH provides scp.exe. Run from this dir: HOST=... bash build_op.sh
 set -euo pipefail
 
 HOST=${HOST:-bz-ascend-relay}          # bz-ascend is down; relay is the working route
@@ -35,7 +38,7 @@ if [ "${1:-build}" = "revert" ]; then
 fi
 
 echo "[1/4] push patched files -> $HOST:$MNT"
-rsync -az torch_binding.cpp torch_binding_meta.cpp all.py "$HOST":"$MNT"/
+scp torch_binding.cpp torch_binding_meta.cpp all.py "$HOST":"$MNT"/
 
 echo "[2/4] drop patched csrc into $CONT:$VA/csrc"
 ssh "$HOST" "docker cp $MNT/torch_binding.cpp      $CONT:$VA/csrc/torch_binding.cpp
