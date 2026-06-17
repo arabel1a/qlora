@@ -13,6 +13,10 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 _TRANSPOSED_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
 _SGMV_SHRINK_FN = None
 _SGMV_EXPAND_SLICE_FN = None
+# Decode path uses bgmv (per-token in-kernel weight indexing): == sgmv speed but needs
+# no compute_meta (only token_lora_indices) and no weight gather. See FINAL design.
+_BGMV_SHRINK_FN = None
+_BGMV_EXPAND_SLICE_FN = None
 
 
 def _gather_weights_for_gmm(w: torch.Tensor, lora_indices: torch.Tensor) -> torch.Tensor:
@@ -66,6 +70,7 @@ def _add_shrink_op(
     max_length: int,
     token_nums: int,
     scaling: float,
+    token_lora_indices: torch.Tensor,
     use_gmm: torch.Tensor,
     no_lora: torch.Tensor,
 ) -> None:
@@ -86,18 +91,19 @@ def _add_shrink_op(
                 result = result * scaling
             out.add_(result.to(out.dtype))
     else:
+        # decode: bgmv indexes the stacked weight per-token in-kernel (no gather,
+        # no per-group metadata) -> uses token_lora_indices, not seq/group meta.
         for slice_idx in range(len(lora_a_stacked)):
-            _SGMV_SHRINK_FN(
+            _BGMV_SHRINK_FN(
                 x, lora_a_stacked[slice_idx], y[slice_idx],
-                b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-                batch_size, max_length, token_nums, scaling,
+                token_lora_indices, scaling,
             )
 
 
 @_add_shrink_op.register_fake
 def _add_shrink_fake(y, x, lora_a_stacked, b_seq_start_loc, seq_len_tensor,
                      lora_indices_tensor, batch_size, max_length, token_nums,
-                     scaling, use_gmm, no_lora):
+                     scaling, token_lora_indices, use_gmm, no_lora):
     return None
 
 
@@ -115,6 +121,7 @@ def _add_expand_op(
     output_slices: List[int],
     offset_start: int,
     add_inputs: bool,
+    token_lora_indices: torch.Tensor,
     use_gmm: torch.Tensor,
     no_lora: torch.Tensor,
 ) -> None:
@@ -141,13 +148,12 @@ def _add_expand_op(
                 target.copy_(result.to(target.dtype))
             offset_left += size
     else:
+        # decode: bgmv expand_slice, per-token weight indexing.
         for slice_idx in range(len(lora_b_stacked)):
             size = output_slices[slice_idx]
-            _SGMV_EXPAND_SLICE_FN(
+            _BGMV_EXPAND_SLICE_FN(
                 x[slice_idx], lora_b_stacked[slice_idx], y,
-                b_seq_start_loc, seq_len_tensor, lora_indices_tensor,
-                batch_size, max_length, token_nums,
-                offset_left, size, add_inputs,
+                token_lora_indices, offset_left, size, add_inputs,
             )
             offset_left += size
 
@@ -155,7 +161,8 @@ def _add_expand_op(
 @_add_expand_op.register_fake
 def _add_expand_fake(y, x, lora_b_stacked, b_seq_start_loc, seq_len_tensor,
                      lora_indices_tensor, batch_size, max_length, token_nums,
-                     output_slices, offset_start, add_inputs, use_gmm, no_lora):
+                     output_slices, offset_start, add_inputs, token_lora_indices,
+                     use_gmm, no_lora):
     return None
 
 
@@ -211,8 +218,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_shrink = sgmv_shrink
 
         global _SGMV_SHRINK_FN, _SGMV_EXPAND_SLICE_FN
+        global _BGMV_SHRINK_FN, _BGMV_EXPAND_SLICE_FN
         _SGMV_SHRINK_FN = sgmv_shrink
         _SGMV_EXPAND_SLICE_FN = sgmv_expand_slice
+        _BGMV_SHRINK_FN = bgmv_shrink
+        _BGMV_EXPAND_SLICE_FN = bgmv_expand_slice
 
         # gmm-vs-sgmv switch (set per batch in update_metadata). CPU tensors so
         # the opaque ops can read them with .item() without a device->host sync.
@@ -244,10 +254,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     ):
         x = x.view(-1, x.shape[-1])
         y_views = [y[i].view(-1, y[i].shape[-1]) for i in range(len(lora_a_stacked))]
-        torch.ops.lora.add_shrink(
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora_shrink(
             y_views, x, list(lora_a_stacked),
-            *self.prefill_metadata, scale,
-            self._use_gmm_shrink_cpu, self._no_lora_cpu,
+            lora_indices, seq_len, self.token_lora_indices,
+            scale, self._use_gmm_shrink_cpu, self._no_lora_cpu,
         )
 
     def add_expand(
@@ -265,9 +276,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y = y.view(-1, y.shape[-1])
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
-        torch.ops.lora.add_expand(
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora_expand(
             y, [x[i] for i in range(len(lora_b_stacked))], list(lora_b_stacked),
-            *self.prefill_metadata,
+            lora_indices, seq_len, self.token_lora_indices,
             list(output_slices), offset_start, add_inputs,
             self._use_gmm_expand_cpu, self._no_lora_cpu,
         )
