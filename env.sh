@@ -5,7 +5,7 @@
 export HOST=0.0.0.0
 
 # vllm magic
-export OMP_PROC_BIND=false
+export OMP_PROC_BIND=true
 export OMP_NUM_THREADS=100
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_V1=1
@@ -15,7 +15,7 @@ export VLLM_RPC_TIMEOUT=100000
 export HCCL_IF_BASE_PORT=48000
 # model
 # export SERVED_MODEL_NAME="qwen3"
-# export SERVED_MODEL_NAME_LORA="lora-adapter"
+export SERVED_MODEL_NAME_LORA="lora-adapter1"
 # export MAX_NUM_SEQ=64
 # export MODEL_TAG="Qwen3-4B-Instruct-2507"
 export MODEL_TAG="Qwen3-32B"
@@ -44,6 +44,7 @@ MAX_GEN_TOKEN=2048
 # export DATASET=/home/russia_mmo/vllm_ascend_hub/vllm_repos/scripts/generated/custom_dataset_qwen3_2000.jsonl
 export START_TIMEOUT=300
 export STOP_TIMEOUT=30
+: "${PROCESS_KILL_TIMEOUT_S:=10}"   # was unbound -> broke cleanup_vllm under set -u
 
 # vllm
 export TENSOR_PARALLEL_SIZE=4
