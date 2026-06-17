@@ -433,6 +433,16 @@ static at::Tensor gather_weights_for_gmm(const at::Tensor &w_in, const at::Tenso
     return g.masked_fill(inactive, 0);
 }
 
+// bgmv requires indices.size(0) == x.size(0). Under torch.compile/aclgraph the hidden
+// states x are padded to a capture size while token_lora_indices stays at the real token
+// count, so normalize: pad with -1 (no-lora -> 0 contribution for padding rows) or slice.
+static at::Tensor match_rows(const at::Tensor &idx, int64_t rows)
+{
+    if (idx.size(0) == rows) return idx;
+    if (idx.size(0) < rows) return at::constant_pad_nd(idx, {0, rows - idx.size(0)}, -1);
+    return idx.slice(0, 0, rows);
+}
+
 // use_gmm / no_lora are CPU bool tensors set per step in update_metadata. Read with
 // .item<bool>() (host read on a CPU tensor -> no device sync, aclgraph-safe) so the
 // branch is NOT baked/guarded by torch.compile and needs no recompile per token count.
@@ -454,8 +464,9 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
             y[s].add_(res.to(y[s].scalar_type()));
         }
     } else {                      // decode -> bgmv
+        at::Tensor idx = match_rows(token_lora_indices, x.size(0));
         for (size_t s = 0; s < lora_a.size(); ++s) {
-            bgmv_shrink(x, lora_a[s], token_lora_indices, y[s], scale);
+            bgmv_shrink(x, lora_a[s], idx, y[s], scale);
         }
     }
 }
@@ -487,7 +498,8 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
     } else {                      // decode -> bgmv (always accumulates into y)
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
-            bgmv_expand(x[s], lora_b[s], token_lora_indices, y, offset, size);
+            at::Tensor idx = match_rows(token_lora_indices, x[s].size(0));
+            bgmv_expand(x[s], lora_b[s], idx, y, offset, size);
             offset += size;
         }
     }
