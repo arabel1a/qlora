@@ -220,6 +220,12 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     return {masked_input, mask};
 }
 
+// match_rows (defined further below): pad(-1)/slice indices to x's row count so the bgmv
+// kernels tolerate the padded-x shapes that torch.compile/aclgraph capture produces.
+// Applied inside the wrappers so ALL bgmv callers are covered — add_lora_*, the embedding
+// path (add_lora_embedding -> bgmv_expand), and logits — not just add_lora_*.
+static at::Tensor match_rows(const at::Tensor &idx, int64_t rows);
+
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
 {
     at::ScalarType scalar_type = x.scalar_type();
@@ -229,13 +235,13 @@ void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Ten
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
     TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
-    TORCH_CHECK(x.size(0) == y.size(0) && x.size(0) == indices.size(0),
-                "the first dimension of x, y, indices should be same");
+    TORCH_CHECK(x.size(0) == y.size(0), "the first dimension of x, y should be same");
     TORCH_CHECK(x.size(1) > y.size(1), "hidden in should be greater than hidden out");
+    at::Tensor idx = match_rows(indices, x.size(0));   // tolerate padded x (compile/aclgraph)
     void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();
-    void* indices_ptr = indices.data_ptr();
-    int indices_size = indices.size(0);
+    void* indices_ptr = idx.data_ptr();
+    int indices_size = idx.size(0);
     void* y_ptr = y.data_ptr();
     int batch_size = x.size(0);
     int input_hidden_token = x.size(1);
@@ -270,18 +276,18 @@ at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, a
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
     TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
-    TORCH_CHECK(x.size(0) == y.size(0) && x.size(0) == indices.size(0),
-                "the first dimension of x, y, indices should be same");
+    TORCH_CHECK(x.size(0) == y.size(0), "the first dimension of x, y should be same");
     TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
                 "slice_size + slice_offset should be smaller than the second dimension of y")
 
+    at::Tensor idx = match_rows(indices, x.size(0));   // tolerate padded x (compile/aclgraph)
     at::Tensor y_out = y;
     void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();
-    void* indices_ptr = indices.data_ptr();
-    int indices_size = indices.size(0);
+    void* indices_ptr = idx.data_ptr();
+    int indices_size = idx.size(0);
     void* y_ptr = y.data_ptr();
     void* y_out_ptr = y_out.data_ptr();
     int batch_size = x.size(0);
