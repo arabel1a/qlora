@@ -162,11 +162,6 @@ def test_lora_linear(
            f"R={rank} H={hidden_size} reqs={num_requests}")
     print(f"\n{tag}")
 
-    # Clear the weight transpose cache between tests to avoid stale entries
-    # when NPU reuses memory addresses for different-shaped tensors.
-    from vllm_ascend.lora import punica_npu as _pnpu
-    _pnpu._TRANSPOSED_WEIGHT_CACHE.clear()
-
     torch.manual_seed(42)
 
     # Weights: vllm stacked layout — [max_loras+1, ...], slot 0 = zeros (no-lora)
