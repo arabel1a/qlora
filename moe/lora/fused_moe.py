@@ -135,15 +135,37 @@ def _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids):
     return expert_per_row, lora_per_row
 
 
-def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row_idx, topk_ids):
+# Marker returned by moe_lora_apply_w13 when it took the grouped-matmul path, so
+# moe_lora_apply_w2 takes the same path (and skips the bgmv routing tuple).
+_GMM_ROUTING = ("gmm",)
+
+
+def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row_idx,
+                       topk_ids, group_list=None, group_list_type=1):
     """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
 
-    Called from ``unquant_apply_mlp`` right after the base gate_up GMM. Returns
-    the recovered per-row routing so the w2 delta can reuse it.
+    Called from ``unquant_apply_mlp`` right after the base gate_up GMM. When a
+    single adapter is active and the batch is in the gmm regime (``_use_moe_gmm``,
+    i.e. token_num > threshold / eager prefill), apply the delta with a grouped
+    matmul that reuses the base ``group_list`` -- no per-row routing recovery.
+    Otherwise fall back to the per-row bgmv path. Returns a marker/routing that
+    tells the w2 hook which path to mirror.
     """
+    pw = lora_context.punica_wrapper
+    if getattr(pw, "_use_moe_gmm", False) and getattr(pw, "_single_active_lora_id", None) is not None:
+        pw.add_lora_fused_moe_gmm(
+            y=gate_up_out,
+            x=hidden_states,
+            lora_a_stacked=lora_context.w13_lora_a_stacked,
+            lora_b_stacked=lora_context.w13_lora_b_stacked,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            lora_id=pw._single_active_lora_id,
+        )
+        return _GMM_ROUTING
     routing = _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids)
     expert_per_row, lora_per_row = routing
-    lora_context.punica_wrapper.add_lora_fused_moe(
+    pw.add_lora_fused_moe(
         y=gate_up_out,
         x=hidden_states,
         lora_a_stacked=lora_context.w13_lora_a_stacked,
@@ -155,14 +177,29 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row
     return routing
 
 
-def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing):
+def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing,
+                      group_list=None, group_list_type=1):
     """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
 
-    Reuses the per-row routing computed by ``moe_lora_apply_w13``; ``silu_out``
-    is the activation output that fed the base down GMM.
+    Mirrors the path w13 took: grouped matmul (reusing ``group_list``) when
+    ``lora_routing is _GMM_ROUTING``, else the per-row bgmv reusing the routing
+    tuple computed by w13. ``silu_out`` is the activation that fed the base down
+    GMM (same expert-permuted order as ``group_list``).
     """
+    pw = lora_context.punica_wrapper
+    if lora_routing is _GMM_ROUTING:
+        pw.add_lora_fused_moe_gmm(
+            y=down_out,
+            x=silu_out,
+            lora_a_stacked=lora_context.w2_lora_a_stacked,
+            lora_b_stacked=lora_context.w2_lora_b_stacked,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            lora_id=pw._single_active_lora_id,
+        )
+        return
     expert_per_row, lora_per_row = lora_routing
-    lora_context.punica_wrapper.add_lora_fused_moe(
+    pw.add_lora_fused_moe(
         y=down_out,
         x=silu_out,
         lora_a_stacked=lora_context.w2_lora_a_stacked,

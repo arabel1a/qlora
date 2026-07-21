@@ -2,11 +2,12 @@ import os
 from collections.abc import Callable
 
 import torch
+import torch_npu
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-GMM_TOKEN_THRESHOLD = 1024
+GMM_TOKEN_THRESHOLD = int(os.environ.get("LORA_GMM_THRESHOLD", "1024"))
 
 # Runtime gate for the gmm path.
 #   off       -> gmm disabled, pure bgmv (committed-safe default)
@@ -64,6 +65,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         # whether compute_meta (prefill_metadata) was computed this step
         self._prefill_meta_ready = False
+        # MoE-LoRA single-adapter gmm fast path (see add_lora_fused_moe_gmm).
+        # Both are host-only (no device tensor) and set per step in
+        # update_metadata: safe to branch on in Python because the gmm path only
+        # activates when `enabled` (token_num > threshold), which is the eager
+        # prefill regime -- decode (captured by aclgraph) always stays on bgmv.
+        self._single_active_lora_id: int | None = None
+        self._use_moe_gmm = False
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         # Base metadata (token_lora_indices) is needed by the bgmv decode path and is
@@ -91,6 +99,18 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_gmm_expand_cpu.fill_(enabled)
         self._use_gmm_shrink_cpu.fill_(enabled)
         self._no_lora_cpu.fill_(no_lora)
+        # MoE-LoRA gmm fast path is only correct when a single adapter is active
+        # in the batch (then every row routed to expert e uses that adapter's
+        # (lora, e) weight, so the LoRA groups == the expert groups). Detect the
+        # sole active slot host-side: index_mapping holds lora ids (>0), the slot
+        # is lora_index_to_id.index(id) -- same convention as token_lora_indices,
+        # no device sync. Gate on `enabled` so it never fires in captured decode.
+        active_ids = {x for x in mapping.index_mapping if x > 0}
+        if len(active_ids) == 1:
+            self._single_active_lora_id = lora_index_to_id.index(active_ids.pop())
+        else:
+            self._single_active_lora_id = None
+        self._use_moe_gmm = enabled and self._single_active_lora_id is not None
         # prefill_metadata is only valid when we ran compute_meta (enabled). Consumers
         # that use it (add_lora_embedding's sgmv path) must fall back to bgmv otherwise.
         self._prefill_meta_ready = enabled
@@ -261,6 +281,54 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
             self.bgmv_expand_slice(delta, b_flat, y2d, combined_idx, cur_offset, out_size, add_inputs=True)
             cur_offset += out_size
+
+    def add_lora_fused_moe_gmm(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple,
+        lora_b_stacked: tuple,
+        *,
+        group_list: torch.Tensor,
+        group_list_type: int,
+        lora_id: int,
+        offset: int = 0,
+    ) -> None:
+        """Single-adapter grouped-matmul MoE-LoRA (the cube-core path).
+
+        ``x`` is the expert-permuted activation the base expert GMM already
+        consumes (``hidden_states`` for w13, the swiglu output for w2) and
+        ``group_list`` is the base per-expert token count. Because a single
+        adapter is active, every row routed to expert ``e`` uses the same
+        ``(lora_id, e)`` weight, so the LoRA groups are exactly the expert groups
+        -- no per-row gather, no ``combined_idx``, no routing recovery. One
+        ``npu_grouped_matmul`` for shrink and one for expand per slice, on the
+        cube cores, reusing the base ``group_list`` verbatim. The delta is added
+        into ``y`` before the caller's routed-weight scaling, mirroring the bgmv
+        path's insertion point.
+        """
+        x2d = x.view(-1, x.shape[-1])
+        y2d = y.view(-1, y.shape[-1])
+        cur = offset
+        for s in range(len(lora_a_stacked)):
+            a = lora_a_stacked[s][lora_id]        # [num_experts, rank, hidden]
+            b = lora_b_stacked[s][lora_id]        # [num_experts, out_s, rank]
+            out_s = b.shape[-2]
+            # npu_grouped_matmul(group_type=0) wants weight [E, K, N]; the stacks
+            # are [E, N, K]. TODO: cache the transpose per (adapter, slice) -- the
+            # stacks are updated in place on adapter swap so key on values, not id.
+            a_t = a.transpose(1, 2).contiguous()  # [E, hidden, rank]
+            b_t = b.transpose(1, 2).contiguous()  # [E, rank, out_s]
+            shrink = torch_npu.npu_grouped_matmul(
+                x=[x2d], weight=[a_t], split_item=2, group_type=0,
+                group_list_type=group_list_type, group_list=group_list,
+            )[0]                                  # [M, rank]
+            delta = torch_npu.npu_grouped_matmul(
+                x=[shrink], weight=[b_t], split_item=2, group_type=0,
+                group_list_type=group_list_type, group_list=group_list,
+            )[0]                                  # [M, out_s]
+            y2d[:, cur:cur + out_s] += delta.to(y2d.dtype)
+            cur += out_s
 
     def add_lora_linear(
         self,

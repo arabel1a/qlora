@@ -363,6 +363,8 @@ def unquant_apply_mlp(
             hidden_states=hidden_states,
             expanded_row_idx=expanded_row_idx,
             topk_ids=topk_ids,
+            group_list=group_list,
+            group_list_type=group_list_type,
         )
 
     if activation == "swigluoai":
@@ -394,6 +396,8 @@ def unquant_apply_mlp(
             down_out=hidden_states,
             silu_out=gate_up_out,
             lora_routing=lora_routing,
+            group_list=group_list,
+            group_list_type=group_list_type,
         )
     return hidden_states
 

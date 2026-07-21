@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 results/
 res_sgmv*.txt
+traces/
+*.tar.gz
