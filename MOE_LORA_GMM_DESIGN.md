@@ -143,7 +143,7 @@ device sync, graph-capture safe (values change, shapes don't; same as the base `
 `Index` gathers, `combined_idx` (`GreaterEqual`+`LogicalAnd`+`Mul`+`Where`). ~215 ms/window in the
 trace → ~0.
 
-## 4. Multi-adapter extension (general correctness)
+## 4. Multi-adapter extension (general correctness) — IMPLEMENTED
 
 When >1 adapter is active, rows within one expert block belong to different loras, so per-expert
 grouping is insufficient. Reuse the base expert permutation and add a **stable sub-sort by lora
@@ -159,6 +159,41 @@ within expert** to get `(expert, lora)` groups:
 Still one gmm per shrink/expand on the cube cores; the only extra work is one small sort + one bincount
 + one gather/scatter per layer — orders of magnitude below the current per-row bgmv. (`max_loras` is
 small, so `E*L` groups stay modest.)
+
+**Hardware constraint found (2026-07-22, on va18_misha):** `npu_grouped_matmul`
+(aclnnGroupedMatmulV4 on CANN 8.5.1) **rejects a `group_list` longer than 1024**
+(`AclNN_Parameter_Error: size of groupList N should be <= 1024`). Grouping over the full
+`num_experts * max_loras` (128 × 16 = 2048) fails. Fix: **group over the ACTIVE adapters only**
+(compaction) and fall back to bgmv above the cap.
+
+**Implementation (`all.py` / `moe/lora/fused_moe.py`):**
+- `update_metadata` publishes `_active_lora_slots` = sorted host list of the lora slots present in
+  the batch (`n_active` of them). Grouping over `n_active`, not `max_loras`, means the group_list
+  length is driven by adapters *actually in the batch*, not the configured capacity — so a config
+  with `max_loras=32` but 4 active in a step gives 4·128 = 512 groups, not 4096.
+- `_build_moe_gmm_multi_plan(expert_per_row, lora_per_row, adapter_enabled, active_slots, num_experts)`
+  → `(order, fine_group_list, active_mask_sorted, active_slots_dev, n_active)`. A `slot_to_compact`
+  table maps each active slot → `[0, n_active)`; `combined = expert*n_active + compact_lora`
+  (expert-major, compact-lora-minor — expert is already sorted, so this sub-sorts by lora within
+  expert); `order = argsort(combined.float())`; `fine_group_list = bincount(combined,
+  minlength=E*n_active)`. The active mask reuses the **exact bgmv masking**
+  `(lora >= 0) & adapter_enabled[lora_safe]` — no-lora / disabled rows are grouped under some slot
+  then zeroed. Built once in the w13 hook, reused verbatim by w2.
+- `add_lora_fused_moe_gmm_multi(...)`: `x_sorted = x[order]`; weights gathered to the active slots
+  (`index_select(0, active_slots)`) then permuted `[n_active, E, …] → [E, n_active, …] →
+  [E*n_active, K, N]` so weight group `g` matches `combined`; two `npu_grouped_matmul` over
+  `E*n_active` groups; `delta *= active_mask_sorted`; un-sort via `index_copy_(0, order, delta)`;
+  slice-add into `y`.
+- Gating: single fast path in `update_metadata` requires `_use_moe_gmm_multi` otherwise; the w13 hook
+  additionally checks `num_experts * n_active <= 1024` and **falls back to bgmv** above the cap
+  (E=128 → up to 8 concurrent adapters on the fused path). The **single fast path now requires
+  `all_rows_have_lora`** — this closes the previously-latent mixed single-lora + no-lora bug (the
+  fast path cannot mask base-only rows). Anything else with ≥1 active adapter takes the multi path.
+
+**Correctness — VALIDATED ON HARDWARE (npu:0, va18_misha):** `test_moe_lora_gmm.py::run_multi`,
+plan+gmm vs a per-row `(expert, lora)` torch reference. All PASS at rel_rms ~2.3e-3 (bf16 noise;
+wrong grouping / missed masking would be O(1)): 4-active/cap-8, 8-active (grp=1024 boundary) with 20%
+no-lora, 2-active with 50% no-lora, **cap-32/4-active (compaction → grp=512)**, 6-active small batch.
 
 ## 5. Validation plan
 
@@ -196,7 +231,13 @@ Prefill MoE-LoRA (~4.3 s bgmv) moved onto the cube cores (+495 ms GroupedMatmul 
 decode correctly stayed on bgmv (the 472 ms residual, token_num < threshold). Trace saved at
 `traces/lora_moegmm/`.
 
-**Follow-ups (not yet done):** cache the weight transpose per (adapter, slice) (currently inline
-`.contiguous()` each call — some of the +495 ms and the Cast bump is this); the multi-adapter path (§4);
-a decode-only A/B to decide whether decode ever wants gmm (my prior: no). Files changed: `all.py`,
-`moe/lora/fused_moe.py`, `moe/ops/moe_mlp.py`; test `test_moe_lora_gmm.py`.
+**Follow-ups (not yet done):** cache the weight transpose/permute per (adapter, slice) (both the
+single and multi paths do it inline `.contiguous()` each call — some of the +495 ms and the Cast bump
+is this); a decode-only A/B to decide whether decode ever wants gmm (my prior: no). The multi-adapter path (§4)
+is implemented and both kernel-validated and **e2e-measured** (2026-07-23, `LORA_GMM_MULTI=force`,
+single-adapter workload → n_active=1): the general path costs ~2x the single fast path's TTFT (9581 vs
+4688 ms) from the re-added routing recovery + sub-sort + weight gather, but still beats all-bgmv (15748
+ms) by 1.64x. So the gating is right — fast path for single adapter, multi only for genuine >1-adapter.
+Details in the agents vault `summary/20260723_moe_multi_adapter_speed.md`; biggest speedup lever is
+caching the per-(active-set, slice) weight gather/transpose. Files changed: `all.py`,
+`moe/lora/fused_moe.py`, `moe/ops/moe_mlp.py`; test `test_moe_lora_gmm.py`; bench `bench_moe_multi.sh`.

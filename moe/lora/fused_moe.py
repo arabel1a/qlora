@@ -135,21 +135,75 @@ def _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids):
     return expert_per_row, lora_per_row
 
 
-# Marker returned by moe_lora_apply_w13 when it took the grouped-matmul path, so
-# moe_lora_apply_w2 takes the same path (and skips the bgmv routing tuple).
+# Marker returned by moe_lora_apply_w13 when it took the single-adapter grouped-
+# matmul path, so moe_lora_apply_w2 mirrors it (and skips the bgmv routing tuple).
 _GMM_ROUTING = ("gmm",)
+
+
+# npu_grouped_matmul (aclnnGroupedMatmulV4) rejects a group_list longer than 1024
+# ("size of groupList N should be less than or equal to 1024"). The multi-gmm
+# path groups over num_experts * n_active; above this cap it falls back to bgmv.
+_GMM_MAX_GROUPS = 1024
+
+# one-shot proof that the multi path ran (single-element list = mutable module flag).
+_MULTI_FIRED = [False]
+
+
+def _build_moe_gmm_multi_plan(expert_per_row, lora_per_row, adapter_enabled,
+                              active_slots, num_experts):
+    """Sub-sort the (already expert-permuted) rows by ``(expert, active-lora)`` so a
+    single grouped matmul over ``num_experts * n_active`` groups can apply the
+    per-row adapter weight -- the multi-adapter analogue of reusing ``group_list``.
+
+    ``active_slots`` is the host list of lora slots actually present in the batch;
+    grouping over the ``n_active = len(active_slots)`` of them (not the full
+    ``max_loras`` capacity) keeps the group_list short (avoids empty-slot work and
+    stays under the 1024-group cap). Returns
+    ``(order, fine_group_list, active_mask_sorted, active_slots_dev, n_active)``:
+      * ``order`` -- argsort of ``combined = expert*n_active + compact_lora``
+        (float32 trick, exact for these small ids). Reorders the rows into
+        contiguous (expert, active-lora) groups in id order 0..E*n_active-1.
+      * ``fine_group_list`` -- per-group row counts (``group_list_type=1``), fixed
+        shape ``[E*n_active]`` (``bincount`` with ``minlength``). Sums to the rows.
+      * ``active_mask_sorted`` -- bool per sorted row, False for no-lora / disabled
+        rows (grouped under some slot, zeroed after the matmul).
+      * ``active_slots_dev`` -- the active slots as a device LongTensor, used to
+        gather the weight stacks to compact order.
+
+    All inputs come from the base routing + the constant ``token_lora_indices``
+    (+ the host active-slot list); no ``.item()`` / data-dependent host sync.
+    """
+    device = lora_per_row.device
+    n_active = len(active_slots)
+    lora_safe = lora_per_row.clamp(min=0)
+    active = (lora_per_row >= 0) & adapter_enabled[lora_safe].bool()
+    # real slot -> compact index [0, n_active). Unused slots map to 0; the rows
+    # that land there are inactive and get masked, so the collision is harmless.
+    active_slots_dev = torch.tensor(active_slots, dtype=torch.long, device=device)
+    slot_to_compact = torch.zeros(adapter_enabled.shape[0], dtype=torch.long, device=device)
+    slot_to_compact[active_slots_dev] = torch.arange(n_active, dtype=torch.long, device=device)
+    compact = slot_to_compact[lora_safe]
+    combined = expert_per_row.to(torch.long) * n_active + compact
+    order = torch.argsort(combined.to(torch.float32))
+    fine_group_list = torch.bincount(combined, minlength=num_experts * n_active)
+    active_mask_sorted = active.index_select(0, order)
+    return order, fine_group_list, active_mask_sorted, active_slots_dev, n_active
 
 
 def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row_idx,
                        topk_ids, group_list=None, group_list_type=1):
     """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
 
-    Called from ``unquant_apply_mlp`` right after the base gate_up GMM. When a
-    single adapter is active and the batch is in the gmm regime (``_use_moe_gmm``,
-    i.e. token_num > threshold / eager prefill), apply the delta with a grouped
-    matmul that reuses the base ``group_list`` -- no per-row routing recovery.
-    Otherwise fall back to the per-row bgmv path. Returns a marker/routing that
-    tells the w2 hook which path to mirror.
+    Called from ``unquant_apply_mlp`` right after the base gate_up GMM. In the gmm
+    regime (``token_num > threshold`` / eager prefill) there are two cube-core
+    paths: a single-adapter fast path (``_use_moe_gmm``) that reuses the base
+    ``group_list`` verbatim -- no routing recovery, no masking -- and a
+    multi-adapter path (``_use_moe_gmm_multi``, also taken when one adapter is
+    mixed with no-lora rows) that sub-sorts the rows by ``(expert, active-lora)``
+    and runs one grouped matmul over ``num_experts * n_active`` groups (n_active =
+    adapters present in the batch). If that group count exceeds npu_grouped_matmul's
+    1024 cap, or in the decode / non-gmm regime, fall back to the per-row bgmv path.
+    Returns a marker/routing that tells the w2 hook which path to mirror.
     """
     pw = lora_context.punica_wrapper
     if getattr(pw, "_use_moe_gmm", False) and getattr(pw, "_single_active_lora_id", None) is not None:
@@ -164,6 +218,39 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row
         )
         return _GMM_ROUTING
     routing = _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids)
+    if getattr(pw, "_use_moe_gmm_multi", False):
+        # >1 adapter (or single adapter mixed with no-lora rows): grouped matmul
+        # over (expert, active-lora) groups on the cube cores, as long as the group
+        # count fits npu_grouped_matmul's 1024 cap. Recover per-row (expert, lora),
+        # build the sub-sort plan once, and reuse it for w2.
+        expert_per_row, lora_per_row = routing
+        num_experts = lora_context.w13_lora_a_stacked[0].shape[1]
+        active_slots = getattr(pw, "_active_lora_slots", [])
+        n_active = len(active_slots)
+        if 0 < n_active and num_experts * n_active <= _GMM_MAX_GROUPS:
+            if not _MULTI_FIRED[0]:
+                _MULTI_FIRED[0] = True
+                print(f"[MoE-LoRA] gmm MULTI path FIRED (n_active={n_active}, "
+                      f"groups={num_experts * n_active})", flush=True)
+            plan = _build_moe_gmm_multi_plan(
+                expert_per_row, lora_per_row, lora_context.adapter_enabled,
+                active_slots, num_experts)
+            order, fine_group_list, active_mask_sorted, active_slots_dev, n_act = plan
+            pw.add_lora_fused_moe_gmm_multi(
+                y=gate_up_out,
+                x=hidden_states,
+                lora_a_stacked=lora_context.w13_lora_a_stacked,
+                lora_b_stacked=lora_context.w13_lora_b_stacked,
+                order=order,
+                fine_group_list=fine_group_list,
+                active_mask_sorted=active_mask_sorted,
+                active_slots=active_slots_dev,
+                n_active=n_act,
+                num_experts=num_experts,
+            )
+            return ("gmm_multi", order, fine_group_list, active_mask_sorted,
+                    active_slots_dev, n_act, num_experts)
+        # too many active adapters for the fused grouped matmul -> per-row bgmv.
     expert_per_row, lora_per_row = routing
     pw.add_lora_fused_moe(
         y=gate_up_out,
@@ -181,10 +268,12 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing,
                       group_list=None, group_list_type=1):
     """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
 
-    Mirrors the path w13 took: grouped matmul (reusing ``group_list``) when
-    ``lora_routing is _GMM_ROUTING``, else the per-row bgmv reusing the routing
-    tuple computed by w13. ``silu_out`` is the activation that fed the base down
-    GMM (same expert-permuted order as ``group_list``).
+    Mirrors the path w13 took: single-adapter grouped matmul (reusing
+    ``group_list``) when ``lora_routing is _GMM_ROUTING``; the multi-adapter
+    grouped matmul reusing w13's sub-sort plan when ``lora_routing`` is the
+    ``"gmm_multi"`` tuple; else the per-row bgmv reusing the routing tuple computed
+    by w13. ``silu_out`` is the activation that fed the base down GMM (same
+    expert-permuted order the plan was built against).
     """
     pw = lora_context.punica_wrapper
     if lora_routing is _GMM_ROUTING:
@@ -196,6 +285,24 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing,
             group_list=group_list,
             group_list_type=group_list_type,
             lora_id=pw._single_active_lora_id,
+        )
+        return
+    if isinstance(lora_routing[0], str) and lora_routing[0] == "gmm_multi":
+        # Reuse the exact sub-sort plan w13 built (same expert-permuted order,
+        # same (expert, active-lora) grouping); only the weight stacks differ.
+        (_, order, fine_group_list, active_mask_sorted,
+         active_slots_dev, n_active, num_experts) = lora_routing
+        pw.add_lora_fused_moe_gmm_multi(
+            y=down_out,
+            x=silu_out,
+            lora_a_stacked=lora_context.w2_lora_a_stacked,
+            lora_b_stacked=lora_context.w2_lora_b_stacked,
+            order=order,
+            fine_group_list=fine_group_list,
+            active_mask_sorted=active_mask_sorted,
+            active_slots=active_slots_dev,
+            n_active=n_active,
+            num_experts=num_experts,
         )
         return
     expert_per_row, lora_per_row = lora_routing

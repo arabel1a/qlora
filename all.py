@@ -15,6 +15,13 @@ GMM_TOKEN_THRESHOLD = int(os.environ.get("LORA_GMM_THRESHOLD", "1024"))
 #   force     -> gmm on for every batch (decode too) so it can be tested on short prompts
 _GMM_MODE = os.environ.get("LORA_GMM", "off").lower()
 
+# Benchmark/debug knob: force the multi-adapter MoE-LoRA gmm path even when a single
+# adapter is active (which would normally take the single-adapter fast path). Lets us
+# measure the general (routing-recovery + sub-sort) path's cost on the single-adapter
+# workload. `force` -> single-adapter batches go through add_lora_fused_moe_gmm_multi
+# with n_active=1. Default off (single adapter uses the fast path).
+_GMM_MULTI_FORCE = os.environ.get("LORA_GMM_MULTI", "off").lower() == "force"
+
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
@@ -72,6 +79,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # prefill regime -- decode (captured by aclgraph) always stays on bgmv.
         self._single_active_lora_id: int | None = None
         self._use_moe_gmm = False
+        # MoE-LoRA multi-adapter gmm path (see add_lora_fused_moe_gmm_multi): >1
+        # active adapter, or one adapter mixed with no-lora rows. Same eager-only
+        # activation guarantee as the single path (`enabled`).
+        self._use_moe_gmm_multi = False
 
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         # Base metadata (token_lora_indices) is needed by the bgmv decode path and is
@@ -99,18 +110,48 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_gmm_expand_cpu.fill_(enabled)
         self._use_gmm_shrink_cpu.fill_(enabled)
         self._no_lora_cpu.fill_(no_lora)
-        # MoE-LoRA gmm fast path is only correct when a single adapter is active
-        # in the batch (then every row routed to expert e uses that adapter's
-        # (lora, e) weight, so the LoRA groups == the expert groups). Detect the
-        # sole active slot host-side: index_mapping holds lora ids (>0), the slot
-        # is lora_index_to_id.index(id) -- same convention as token_lora_indices,
-        # no device sync. Gate on `enabled` so it never fires in captured decode.
+        # MoE-LoRA gmm paths (see fused_moe.py). Two regimes, both host-detected
+        # from index_mapping (lora ids, 0 == no-lora) so there is no device sync:
+        #
+        #  * single fast path: exactly one adapter AND every row carries it. Then
+        #    every row routed to expert e uses that adapter's (lora, e) weight, so
+        #    the LoRA groups == the base expert groups -> reuse group_list as-is,
+        #    no routing recovery, no masking. `all_rows_have_lora` is required so a
+        #    mixed single-lora + no-lora batch does NOT take this path (it would
+        #    wrongly apply the delta to the base-only rows, which the fast path
+        #    cannot mask).
+        #  * multi path: >1 adapter, OR one adapter mixed with no-lora rows. Rows
+        #    within an expert block belong to different (lora) slots, so a sub-sort
+        #    by (expert, lora) is needed -- add_lora_fused_moe_gmm_multi. Inactive
+        #    (no-lora / disabled) rows are masked to a zero delta there.
+        #
+        # Slot for a lora id is lora_index_to_id.index(id) (same convention as
+        # token_lora_indices). Gate both on `enabled` so gmm never fires in
+        # captured decode.
         active_ids = {x for x in mapping.index_mapping if x > 0}
-        if len(active_ids) == 1:
-            self._single_active_lora_id = lora_index_to_id.index(active_ids.pop())
+        all_rows_have_lora = bool(mapping.index_mapping) and all(x > 0 for x in mapping.index_mapping)
+        if len(active_ids) == 1 and all_rows_have_lora:
+            self._single_active_lora_id = lora_index_to_id.index(next(iter(active_ids)))
         else:
             self._single_active_lora_id = None
         self._use_moe_gmm = enabled and self._single_active_lora_id is not None
+        # multi covers "single adapter + no-lora rows" too (single path declined).
+        self._use_moe_gmm_multi = (
+            enabled and self._single_active_lora_id is None and len(active_ids) > 0
+        )
+        if _GMM_MULTI_FORCE and enabled and len(active_ids) > 0:
+            # Benchmark: route the single-adapter batch through the multi path too.
+            self._single_active_lora_id = None
+            self._use_moe_gmm = False
+            self._use_moe_gmm_multi = True
+        # Active lora SLOTS (sorted) for the multi-gmm compaction: the grouped
+        # matmul groups over (expert, active-lora), so its group_list length is
+        # num_experts * len(active) -- driven by how many adapters are actually in
+        # the batch, NOT the (possibly large) configured max_loras capacity. This
+        # both avoids empty-slot work and keeps under npu_grouped_matmul's 1024-
+        # group cap (num_experts=128 -> up to 8 concurrent adapters on the fused
+        # path; beyond that fused_moe.py falls back to bgmv). Host-only, no sync.
+        self._active_lora_slots = sorted(lora_index_to_id.index(i) for i in active_ids)
         # prefill_metadata is only valid when we ran compute_meta (enabled). Consumers
         # that use it (add_lora_embedding's sgmv path) must fall back to bgmv otherwise.
         self._prefill_meta_ready = enabled
@@ -328,6 +369,85 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 group_list_type=group_list_type, group_list=group_list,
             )[0]                                  # [M, out_s]
             y2d[:, cur:cur + out_s] += delta.to(y2d.dtype)
+            cur += out_s
+
+    def add_lora_fused_moe_gmm_multi(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple,
+        lora_b_stacked: tuple,
+        *,
+        order: torch.Tensor,
+        fine_group_list: torch.Tensor,
+        active_mask_sorted: torch.Tensor,
+        active_slots: torch.Tensor,
+        n_active: int,
+        num_experts: int,
+        offset: int = 0,
+    ) -> None:
+        """Multi-adapter grouped-matmul MoE-LoRA (the cube-core path, >1 adapter).
+
+        When more than one adapter is active (or one adapter is mixed with
+        base-only rows), per-expert grouping is insufficient: rows within one
+        expert block belong to different lora slots. We keep the base expert
+        permutation (``x`` is already expert-contiguous) and sub-sort by lora
+        within expert to get ``(expert, active-lora)`` groups. All of ``order`` /
+        ``fine_group_list`` / ``active_mask_sorted`` / ``active_slots`` are
+        precomputed once per layer by ``fused_moe._build_moe_gmm_multi_plan``
+        (shared by w13 and w2) from the base routing + the constant
+        ``token_lora_indices`` -- no per-row bgmv, one ``npu_grouped_matmul`` per
+        shrink/expand over ``num_experts * n_active`` groups on the cube cores.
+
+        Grouping is over the ``n_active`` adapters actually present in the batch,
+        not the full ``max_loras`` capacity: the group id of a row is
+        ``expert * n_active + compact_lora`` where ``compact_lora in [0, n_active)``
+        indexes ``active_slots``. The weight stacks (``[max_loras, num_experts,
+        ...]``) are gathered to the active slots (``index_select`` on dim 0),
+        permuted to expert-major, and reshaped to ``[E*n_active, ...]`` so weight
+        group ``g`` matches that id. This keeps the group_list length under
+        npu_grouped_matmul's 1024 cap for realistic active-adapter counts.
+        Inactive (no-lora / disabled) rows are grouped under some slot then zeroed
+        via ``active_mask_sorted`` -- their delta never reaches ``y``.
+        """
+        x2d = x.view(-1, x.shape[-1])
+        y2d = y.view(-1, y.shape[-1])
+        m = x2d.shape[0]
+        x_sorted = x2d.index_select(0, order)          # [M, K], grouped by (expert, active-lora)
+        mask = active_mask_sorted.view(-1, 1)
+        cur = offset
+        for s in range(len(lora_a_stacked)):
+            a = lora_a_stacked[s]                       # [max_loras, num_experts, rank, hidden]
+            b = lora_b_stacked[s]                       # [max_loras, num_experts, out_s, rank]
+            rank = a.shape[-2]
+            hidden = a.shape[-1]
+            out_s = b.shape[-2]
+            # gather the active slots (compact order), then expert-major:
+            # [n_active, E, r, k] -> [E, n_active, r, k] -> [E*n_active, r, k] ->
+            # transpose for gmm's [E*n_active, K, N]. group g = expert*n_active +
+            # compact_lora matches the reshape index.
+            # TODO: cache this gather/permute/transpose per (active-set, slice).
+            a_sel = a.index_select(0, active_slots)     # [n_active, E, rank, hidden]
+            b_sel = b.index_select(0, active_slots)     # [n_active, E, out_s, rank]
+            a_g = (a_sel.permute(1, 0, 2, 3).reshape(num_experts * n_active, rank, hidden)
+                   .transpose(1, 2).contiguous())       # [E*n_active, hidden, rank]
+            b_g = (b_sel.permute(1, 0, 2, 3).reshape(num_experts * n_active, out_s, rank)
+                   .transpose(1, 2).contiguous())       # [E*n_active, rank, out_s]
+            shrink = torch_npu.npu_grouped_matmul(
+                x=[x_sorted], weight=[a_g], split_item=2, group_type=0,
+                group_list_type=1, group_list=fine_group_list,
+            )[0]                                         # [M, rank]
+            delta = torch_npu.npu_grouped_matmul(
+                x=[shrink], weight=[b_g], split_item=2, group_type=0,
+                group_list_type=1, group_list=fine_group_list,
+            )[0]                                         # [M, out_s]
+            delta = delta * mask.to(delta.dtype)         # zero inactive rows
+            # un-sort back to the caller's row order: delta[i] belongs to row
+            # order[i] (x_sorted[i] == x2d[order[i]]). order is a full permutation
+            # so every row is written exactly once.
+            delta_unsorted = torch.zeros((m, out_s), dtype=delta.dtype, device=delta.device)
+            delta_unsorted.index_copy_(0, order, delta)
+            y2d[:, cur:cur + out_s] += delta_unsorted.to(y2d.dtype)
             cur += out_s
 
     def add_lora_linear(
