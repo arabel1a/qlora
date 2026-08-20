@@ -21,11 +21,11 @@ export VLLM_ENGINE_READY_TIMEOUT_S=1800
 export SERVED_MODEL_NAME_LORA="lora-adapter1"
 # export MAX_NUM_SEQ=64
 # export MODEL_TAG="Qwen3-4B-Instruct-2507"
-export MODEL_TAG="Qwen3-32B"
+export MODEL_TAG=${MODEL_TAG:-"Qwen3-32B"}
 # export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-4b-nsfw"
 # export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-32B-lora"
-export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-32B-lora-r8"
-export LORA_ADAPTER2="/home/russia_mmo/models/Qwen3-32B-lora-r8"
+export LORA_ADAPTER1=${LORA_ADAPTER1:-"/home/russia_mmo/models/Qwen3-32B-lora-r8"}
+export LORA_ADAPTER2=${LORA_ADAPTER2:-"/home/russia_mmo/models/Qwen3-32B-lora-r8"}
 export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
 export MAX_LORAS=2 
 export MAX_LORA_RANK=8
@@ -117,7 +117,7 @@ run_server() {
     # shitty pydantic does not digest spaces in json...
     SERVER_ARGS=(
     # --additional_config '{"torchair_graph_config":{"enable":false},"ascend_scheduler_config":{"enabled":false,"enable_chunked_prefill":false,"chunked_prefill_enabled":false}}'
-    # --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
     --port $PORT
     --host=$HOST
     )
@@ -141,9 +141,9 @@ send_request() {
 }
 
 profile(){
-    local model_name=$1
+    local model_name=${1:-$MODEL}
     local STRING=$2
-    rm -rf logs/qlora_profile
+    # rm -r logs/qlora_profile
     send_request $1 $2
     send_request $1 $2
     send_request $1 $2
@@ -166,13 +166,13 @@ run_evalscope() {
         --parallel "$PARALLEL" \
         --model "$model_name" \
         --api openai \
- 	--dataset random \
-	--seed 42 \
-	--tokenizer-path $MODEL\
-	--min-prompt-length $MIN_PROMPT_LENGTH \
-	--max-prompt-length $MAX_PROMPT_LENGTH \
-	--min-tokens $MIN_GEN_TOKEN \
-	--max-tokens $MAX_GEN_TOKEN \
+        --dataset random \
+        --seed 42 \
+        --tokenizer-path $MODEL\
+        --min-prompt-length $MIN_PROMPT_LENGTH \
+        --max-prompt-length $MAX_PROMPT_LENGTH \
+        --min-tokens $MIN_GEN_TOKEN \
+        --max-tokens $MAX_GEN_TOKEN \
         --url "$URL" \
         --prefix-length 0 \
         --extra-args '{"ignore_eos": true}' \

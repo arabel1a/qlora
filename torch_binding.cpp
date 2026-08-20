@@ -437,11 +437,9 @@ void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Ten
     TORCH_CHECK(x.size(1) > y.size(1), "hidden in should be greater than hidden out");
     at::Tensor idx = match_rows(indices, x.size(0)); // tolerate padded x (compile/aclgraph)
     void* x_ptr = x.data_ptr();
-    void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr(); 
     void* indices_ptr = idx.data_ptr();
     int indices_size = idx.size(0);
-    void* y_ptr = y.data_ptr();
     void* y_ptr = y.data_ptr();
     int batch_size = x.size(0);
     int input_hidden_token = x.size(1);
