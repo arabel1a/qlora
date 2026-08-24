@@ -13,7 +13,14 @@ LORA_RANK = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 LORA_ALPHA = int(sys.argv[4]) if len(sys.argv) > 4 else 16
 OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else f"/home/russia_mmo/models/lora-{model_name}-r{LORA_RANK}"
 W_TO_PROJ = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-TARGET_LEAVES = set(W_TO_PROJ) | set(W_TO_PROJ.values())
+ATTN_PROJ = {
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    # DeepSeek-V4-Flash-0731
+    # "wq_a", "wq_b", "wkv", "wo_a", "wo_b", "wgate", "weights_proj",
+    # Qwen3.6-27B
+    # "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj",
+}
+TARGET_LEAVES = set(W_TO_PROJ) | set(W_TO_PROJ.values()) | ATTN_PROJ
 
 def leaf(module_path):
     return module_path.rsplit(".", 1)[-1]

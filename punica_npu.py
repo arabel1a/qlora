@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import os
 from collections.abc import Callable
 
 import torch
@@ -55,7 +55,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
-       self.sgmv_expand = sgmv_expand
         self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
         self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
@@ -64,22 +63,25 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
         token_num = len(mapping.index_mapping)
-        if _GMM_MODE == "force":
+        if GMM_MODE == "force":
             gmm_enabled = True
-        elif _GMM_MODE == "threshold":
+        elif GMM_MODE == "threshold":
             gmm_enabled = token_num > GMM_TOKEN_THRESHOLD
         else:
             gmm_enabled = False
-        if enabled:
+
+        if gmm_enabled:
             self._update_prefill_metadata(self.token_lora_indices)
             no_lora = bool(self.no_lora)
         else:
             no_lora = not any(mapping.index_mapping)
-        self._use_gmm_expand_cpu.fill_(enabled)
-        self._use_gmm_shrink_cpu.fill_(enabled)
+
+        self._use_gmm_expand_cpu.fill_(gmm_enabled)
+        self._use_gmm_shrink_cpu.fill_(gmm_enabled)
         self._no_lora_cpu.fill_(no_lora)
         self.is_prefill = bool(getattr(mapping, "is_prefill", True))
-        self._prefill_meta_ready = enabled
+        self._prefill_meta_ready = gmm_enabled
+
     def add_shrink(
         self,
         y: tuple[torch.Tensor, ...] | torch.Tensor,

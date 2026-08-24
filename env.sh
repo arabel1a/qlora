@@ -72,6 +72,9 @@ COMMON_VLLM_ARGS=(
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --no-enable-prefix-caching
     --trust-remote-code
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    --port $PORT
+    --host=$HOST
     #--no-enable-chunked-prefill
 )
 
@@ -81,6 +84,7 @@ LORA_ARGS=(
   --max-lora-rank $MAX_LORA_RANK
   --lora-modules lora-adapter1=${LORA_ADAPTER1} lora-adapter2=${LORA_ADAPTER2}
 )
+
 
 throughput_bench() {
     vllm bench throughput \
@@ -101,28 +105,11 @@ throughput_bench() {
 }
 
 run_lora_server() {
-    # shitty pydantic does not digest spaces in json...
-    SERVER_ARGS=(
-    # --additional_config '{"ascend_compilation_config":{"enable_npugraph_ex":false}}'
-    # --compilation-config '{"max_cudagraph_capture_size":176}'
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
-    --port $PORT
-    --host=$HOST
-    )
-
-    vllm serve ${COMMON_VLLM_ARGS[@]} ${SERVER_ARGS[@]} ${LORA_ARGS[@]} $@
+    vllm serve ${COMMON_VLLM_ARGS[@]} ${LORA_ARGS[@]} $@
 }
 
 run_server() {
-    # shitty pydantic does not digest spaces in json...
-    SERVER_ARGS=(
-    # --additional_config '{"torchair_graph_config":{"enable":false},"ascend_scheduler_config":{"enabled":false,"enable_chunked_prefill":false,"chunked_prefill_enabled":false}}'
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
-    --port $PORT
-    --host=$HOST
-    )
-
-    vllm serve ${COMMON_VLLM_ARGS[@]} ${SERVER_ARGS[@]} $@
+    vllm serve ${COMMON_VLLM_ARGS[@]} $@
 }
 
 start_profile() {
