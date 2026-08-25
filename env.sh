@@ -17,18 +17,14 @@ export VLLM_ENGINE_READY_TIMEOUT_S=1800
 
 #model
 
-# export SERVED_MODEL_NAME="qwen3"
-export SERVED_MODEL_NAME_LORA="lora-adapter1"
 # export MAX_NUM_SEQ=64
-# export MODEL_TAG="Qwen3-4B-Instruct-2507"
-export MODEL_TAG=${MODEL_TAG:-"Qwen3-32B"}
 # export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-4b-nsfw"
 # export LORA_ADAPTER1="/home/russia_mmo/models/Qwen3-32B-lora"
 export LORA_ADAPTER1=${LORA_ADAPTER1:-"/home/russia_mmo/models/Qwen3-32B-lora-r8"}
 export LORA_ADAPTER2=${LORA_ADAPTER2:-"/home/russia_mmo/models/Qwen3-32B-lora-r8"}
-export MODEL="/home/russia_mmo/models/${MODEL_TAG}"
+export MODEL=${MODEL:-"/home/russia_mmo/models/Qwen3-4B-Instruct-2507"}
 export MAX_LORAS=2 
-export MAX_LORA_RANK=8
+export MAX_LORA_RANK=16
 
 # benchmarks
 : "${NUM_PROMPTS:=80}"
@@ -51,7 +47,7 @@ export STOP_TIMEOUT=30
 : "${PROCESS_KILL_TIMEOUT_S:=10}"   # was unbound -> broke cleanup_vllm under set -u
 
 # vllm
-export TENSOR_PARALLEL_SIZE=4
+export TENSOR_PARALLEL_SIZE=${TP:-4}
 export DATA_PARALLEL_SIZE=1
 export MAX_NUM_SEQ=32
 : "${MAX_MODEL_LEN:=32768}"

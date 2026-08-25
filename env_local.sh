@@ -2,6 +2,7 @@ set -euo pipefail
 
 export CONTAINER_NAME=${CONTAINER_NAME:-vllm_misha}
 export HOST=${HOST:-bz-ascend}
+export CODE_DIR=${CODE_DIR:-/home/misha/qlora}
 
 function create_container {
   IMAGE=${IMAGE:-"quay.nju.edu.cn/ascend/vllm-ascend:v0.23.0rc1-openeuler"}
@@ -31,7 +32,6 @@ function create_container {
     --ipc shareable \
     -v /home/misha:/home/misha \
     --rm \
-    --npu all \
     $IMAGE
   """
   echo $CMD $HOST
@@ -40,11 +40,11 @@ function create_container {
 
 function clean_copy {
   recreate=${recreate:-true}
-  ssh $HOST "rm -rf /home/misha/qlora/*" 
+  ssh $HOST "rm -rf $CODE_DIR/*" 
   if $recreate; then
     ssh $HOST "docker stop $CONTAINER_NAME" || echo "Creating new container"
     # ssh bz-ascend-relay "docker rm $CONTAINER_NAME"
     create_container
   fi
-  rsync -azv --exclude="tmp/" --exclude="logs" --exclude=".*" ./* $HOST:/home/misha/qlora/
+  rsync -azv --exclude="tmp/" --exclude="logs" --exclude=".*" ./* $HOST:$CODE_DIR
 }
