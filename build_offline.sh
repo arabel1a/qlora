@@ -10,8 +10,8 @@ export COMPILE_CUSTOM_KERNELS=1
 export SOC_VERSION=ascend910b1
 
 echo "[1/3] copy patched csrc into $VA/csrc"
-cp "$SRC/torch_binding.cpp"      "$VA/csrc/torch_binding.cpp"
-cp "$SRC/torch_binding_meta.cpp" "$VA/csrc/torch_binding_meta.cpp"
+cp "$SRC/torch_binding_7d45286c9.cpp"      "$VA/csrc/torch_binding.cpp"
+cp "$SRC/torch_binding_meta_7d45286c9.cpp" "$VA/csrc/torch_binding_meta.cpp"
 
 echo "[2/3] clean-rebuild vllm_ascend_C (backup .so first)"
 cd "$VA"

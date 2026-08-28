@@ -41,7 +41,7 @@ function create_container {
 
 function clean_copy {
   recreate=${recreate:-true}
-  ssh $HOST "rm -rf $CODE_DIR/*" 
+  ssh $HOST "sudo rm -rf $CODE_DIR/*" 
   if $recreate; then
     ssh $HOST "docker stop $CONTAINER_NAME" || echo "Creating new container"
     # ssh bz-ascend-relay "docker rm $CONTAINER_NAME"
