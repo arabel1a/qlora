@@ -1,0 +1,5 @@
+tmp_scripts/
+.DS_Store
+*.swp
+logs/
+tmp/

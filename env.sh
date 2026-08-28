@@ -2,7 +2,7 @@
 # vllm
 : "${PORT:=1606}"
 : "${DEVICES:=0,1,2,3}"
-export HOST=0.0.0.0
+export HOST=127.0.0.1
 
 # vllm magic
 export OMP_PROC_BIND=true
@@ -70,8 +70,10 @@ COMMON_VLLM_ARGS=(
     --trust-remote-code
     --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
     --port $PORT
-    --host=$HOST
+    --host $HOST
     #--no-enable-chunked-prefill
+    --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"multistream_dsa_preprocess":false}'
+    --safetensors-load-strategy prefetch
 )
 
 LORA_ARGS=(

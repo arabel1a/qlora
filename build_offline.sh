@@ -20,7 +20,9 @@ python setup.py build_ext --inplace
 
 python -c "import torch, torch_npu, vllm_ascend.vllm_ascend_C; print('op present:', hasattr(torch.ops._C_ascend, 'add_lora_shrink'))"
 
-echo "[3/3] deploy punica_npu.py"
-cp "$SRC/punica_npu.py" "$VA/vllm_ascend/lora/punica_npu.py"
+echo "[3/3] deploy patches"
+# cp "$SRC/punica_npu.py" "$VA/vllm_ascend/lora/punica_npu.py"
+cp $SRC/dsv4_7d45286c9.py $VA/vllm_ascend/models/deepseek_v4.py
+cp $SRC/punica_7d45286c9.py $VA/vllm_ascend/lora/punica_npu.py
 
 echo "DONE. Restart the vLLM server to load the new op + punica."

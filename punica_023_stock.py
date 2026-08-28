@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
+
 from collections.abc import Callable
 
 import torch
@@ -9,14 +9,8 @@ from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
-# Runtime gate for the gmm path.
-#   off       -> gmm disabled, pure bgmv (committed-safe default)
-#   threshold -> gmm on when token_nums > GMM_TOKEN_THRESHOLD (the prod regime)
-#   force     -> gmm on for every batch (decode too) so it can be tested on short prompts
-GMM_MODE = os.environ.get("LORA_GMM", "off").lower()
-GMM_MULTI_FORCE = os.environ.get("LORA_GMM_MULTI", "off").lower() == "force"
-GMM_TOKEN_THRESHOLD = int(os.environ.get("LORA_GMM_THRESHOLD", "1024"))
-
+# The platforms that are compatible with the PyTorch-native implementation can
+# inherit this class
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
     PunicaWrapperNPU is designed to manage and provide metadata for the punica
@@ -55,47 +49,136 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
-        self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
-        self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
-        self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
-        self._prefill_meta_ready = False
-        
-    def update_metadata(
+    def _shrink_prefill(
         self,
-        mapping,
-        lora_index_to_id,
-        max_loras,
-        vocab_size,
-        **kwargs,
-    ) -> None:
-        # when all prefill requests will be served with GMM, switch to self._update_base_metadata
-        super().update_metadata(
-            mapping,
-            lora_index_to_id,
-            max_loras,
-            vocab_size,
-            **kwargs,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        scale: float,
+    ):
+        # No LoRA request, so return directly
+        if self.no_lora:
+            return
+        self.sgmv_shrink(
+            x,
+            w_t_all,
+            y,
+            *self.prefill_metadata,
+            scale,
         )
 
-        token_num = len(mapping.index_mapping)
-        if GMM_MODE == "force":
-            gmm_enabled = True
-        elif GMM_MODE == "threshold":
-            gmm_enabled = token_num > GMM_TOKEN_THRESHOLD
-        else:
-            gmm_enabled = False
+    def _shrink_decode(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        scale: float,
+    ):
+        self.bgmv_shrink(x, w_t_all, y, self._get_token_lora_indices(x), scale)
 
-        if gmm_enabled:
-            self._update_prefill_metadata(self.token_lora_indices)
-            no_lora = bool(self.no_lora)
-        else:
-            no_lora = not any(mapping.index_mapping)
+    def _expand_prefill(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        add_inputs: bool,
+    ):
+        # No LoRA request, so return directly
+        if self.no_lora:
+            return
+        self.sgmv_expand(
+            x,
+            w_t_all,
+            y,
+            *self.prefill_metadata,
+            add_inputs,
+        )
 
-        self._use_gmm_expand_cpu.fill_(gmm_enabled)
-        self._use_gmm_shrink_cpu.fill_(gmm_enabled)
-        self._no_lora_cpu.fill_(no_lora)
-        self.is_prefill = bool(getattr(mapping, "is_prefill", True))
-        self._prefill_meta_ready = gmm_enabled
+    def _expand_decode(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        add_inputs: bool,
+    ):
+        self.bgmv_expand(x, w_t_all, y, self._get_token_lora_indices(x), add_inputs)
+
+    def _expand_slice_prefill(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        y_offset: int,
+        y_slice_size: int,
+        add_inputs: bool,
+    ):
+        # No LoRA request, so return directly
+        if self.no_lora:
+            return
+        self.sgmv_expand_slice(
+            x,
+            w_t_all,
+            y,
+            *self.prefill_metadata,
+            y_offset,
+            y_slice_size,
+            add_inputs,
+        )
+
+    def _expand_slice_decode(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        y_offset: int,
+        y_slice_size: int,
+        add_inputs: bool,
+    ):
+        self.bgmv_expand_slice(
+            x,
+            w_t_all,
+            y,
+            self._get_token_lora_indices(x),
+            y_offset,
+            y_slice_size,
+            add_inputs,
+        )
+
+    def _get_token_lora_indices(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
+
+    def _apply_expand(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        y_offset: int,
+        y_slice_size: int,
+        add_inputs: bool = True,
+    ):
+        """
+        Perform the ` y[:,y_offset:y_offset+y_slice_size]+=x@w_t_all`
+        computation, which is suitable for the
+        GEMM of lora'b.
+        """
+
+        expand_slice_fun: Callable = self._expand_slice_prefill if self.is_prefill else self._expand_slice_decode
+        expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
+
+    def _apply_shrink(self, y: torch.Tensor, x: torch.Tensor, w_t_all: torch.Tensor, scale: float):
+        """
+        Perform the ` y+=x@w_t_all` computation, which is suitable for the
+        GEMM of lora'a.
+        When `is_prefill is` true, it indicates that it is currently the
+        prefill stage, and the `_shrink_prefill` function should be called.
+        Otherwise, it is the decode stage, and the _shrink_decode function
+        should be called.
+        """
+        y_org = y
+        y = y.view(-1, y.shape[-1])
+        shrink_fun: Callable = self._shrink_prefill if self.is_prefill else self._shrink_decode
+        shrink_fun(y, x, w_t_all, scale)
+        y = y.view_as(y_org)
 
     def add_shrink(
         self,
@@ -106,8 +189,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ):
         """
-        Performs GEMM  for multiple slices of lora_a. 
-        Prefill/decode kernel is choosen within native op.
+        Performs GEMM  for multiple slices of lora_a.
+        When `is_prefill is` true, it indicates that it is currently the
+        prefill stage, and the `_shrink_prefill` function should be called.
+        Otherwise, it is the decode stage, and the _shrink_decode function
+        should be called.
+
         Semantics:
         for i in range(len(lora_a_stacked)):
             y[i] += (x @ lora_a_stacked[i]) * scale
@@ -120,13 +207,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        y_views = [y[i].view(-1, y[i].shape[-1]) for i in range(len(lora_a_stacked))]
-        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
-        torch.ops._C_ascend.add_lora_shrink(
-            y_views, x, list(lora_a_stacked),
-            lora_indices, seq_len, self.token_lora_indices,
-            scale, self._use_gmm_shrink_cpu, self._no_lora_cpu,
-        )
+        # TODO fuse these kernels
+        for slice_idx in range(len(lora_a_stacked)):
+            self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
 
     def add_expand(
         self,
@@ -157,20 +240,24 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
-        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
-        torch.ops._C_ascend.add_lora_expand(
-            y, [x[i] for i in range(len(lora_b_stacked))], list(lora_b_stacked),
-            lora_indices, seq_len, self.token_lora_indices,
-            list(output_slices), offset_start, add_inputs,
-            self._use_gmm_expand_cpu, self._no_lora_cpu,
-        )
+        offset_left = offset_start
+        for slice_idx in range(len(lora_b_stacked)):
+            self._apply_expand(
+                y,
+                x[slice_idx],
+                lora_b_stacked[slice_idx],
+                offset_left,
+                output_slices[slice_idx],
+                add_inputs=add_inputs,
+            )
+            offset_left += output_slices[slice_idx]
         y = y.view_as(y_org)
 
     def add_lora_embedding(
         self, y: torch.Tensor, x: torch.Tensor, lora_b_stacked: torch.Tensor, add_inputs: bool = True, **kwargs
     ) -> None:
         """
-        Applies lora specifically for VocabParallelEmbeddingWithLoRA.
+        Applies lora  specifically for VocabParallelEmbeddingWithLoRA.
 
         Semantics:
             y += x @ lora_b_stacked
@@ -181,13 +268,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             lora_b_stacked (torch.Tensor): lora_b's weights.
             add_inputs (bool): Default to True.
         """
-        if self.no_lora:
-            return
+
+        # Embedding layer only need expand op
+        expand_fun: Callable = self._expand_prefill if self.is_prefill else self._expand_decode
         x = x.to(torch.float32)
-        if self._prefill_meta_ready:
-            self.sgmv_expand(x, lora_b_stacked, y, *self.prefill_metadata, add_inputs)
-        else:
-            self.bgmv_expand(x, lora_b_stacked, y, self.token_lora_indices, add_inputs)
+        expand_fun(y, x, lora_b_stacked, add_inputs)
 
     def add_lora_linear(
         self,
@@ -211,7 +296,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     indices[i], layer_idx, :, :] @ lora_b_stacked[
                     indices[i], layer_idx, :, :]
                     * scale
-                    ).squeeze(0)
+                    ).squeeze(0)+lora_bias_stacked[i]
 
         Args:
             y (torch.Tensor): Output tensor. Will be changed in-place.
@@ -336,7 +421,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ) -> None:
         """
-        Applies lora specifically for LogitsProcessorWithLoRA.
+        Applies lora  specifically for LogitsProcessorWithLoRA.
 
         Semantics:
             buffer = (x @ lora_a_stacked) * scale
@@ -358,8 +443,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if buffer is None:
             buffer = torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
 
-        # the slice happens in fixed bgmv kernel
-        indices = self.sampler_indices
+        indices = torch.narrow(self._sampler_indices, 0, 0, x.size(0))
+
         self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
         self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
 

@@ -3,12 +3,15 @@ set -euo pipefail
 export CONTAINER_NAME=${CONTAINER_NAME:-vllm_misha}
 export HOST=${HOST:-bz-ascend}
 export CODE_DIR=${CODE_DIR:-/home/misha/qlora}
+export IMAGE=${IMAGE:-"quay.io/ascend/vllm-ascend"}
+export TAG=${TAG:-"v0.23.0rc1-openeuler"}
+export DATA_DIR=${DATA_DIR:-"/home/russia_mmo"}
 
 function create_container {
-  IMAGE=${IMAGE:-"quay.nju.edu.cn/ascend/vllm-ascend:v0.23.0rc1-openeuler"}
   CMD="""
-  docker run -itd --name "$CONTAINER_NAME" \
+  sudo docker run -itd --name "$CONTAINER_NAME" \
     --shm-size 50g \
+    --net host \
     --device=/dev/davinci0 \
     --device=/dev/davinci1 \
     --device=/dev/davinci2 \
@@ -25,14 +28,12 @@ function create_container {
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
-    -v /data/models:/data/models \
-    -v /data/lab-shared:/data/lab-shared \
+    -v $DATA_DIR:$DATA_DIR \
     --user root \
     --entrypoint /bin/bash \
-    --ipc shareable \
     -v /home/misha:/home/misha \
     --rm \
-    $IMAGE
+    $IMAGE:$TAG
   """
   echo $CMD $HOST
   ssh $HOST $CMD
@@ -47,4 +48,10 @@ function clean_copy {
     create_container
   fi
   rsync -azv --exclude="tmp/" --exclude="logs" --exclude=".*" ./* $HOST:$CODE_DIR
+}
+
+function hk2_proxy_up {
+  cmd="docker exec $CONTAINER_NAME 'cp -r /home/misha/.ssh ~i && ssh -fN -D 1080 node1 && git config --global http.proxy socks5h://127.0.0.1:1080 && git config --global https.proxy socks5h://127.0.0.1:1080'"  
+  ssh $HOST $cmd
+
 }
