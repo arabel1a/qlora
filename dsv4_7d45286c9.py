@@ -1220,7 +1220,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-     hf_to_vllm_mapper = WeightsMapper(
+    hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_regex={
             re.compile(r"rotary_emb\.inv_freq"): None,
             re.compile(r"^(?!model)"): "model.",

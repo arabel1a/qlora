@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Callable
-
+import os
 import torch
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -97,7 +97,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         self._use_gmm_expand_cpu.fill_(gmm_enabled)
         self._use_gmm_shrink_cpu.fill_(gmm_enabled)
-        self._no_lora_cpu.fill_(no_lora)
+        self._no_lora_cpu.fill_(self.no_lora)
         self.is_prefill = bool(getattr(mapping, "is_prefill", True))
         self._prefill_meta_ready = gmm_enabled
 

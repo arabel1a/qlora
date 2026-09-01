@@ -35,8 +35,8 @@ export MAX_LORA_RANK=16
 WARMUP_PROMPTS_NUM=8
 MIN_PROMPT_LENGTH=2048
 MAX_PROMPT_LENGTH=2048
-MIN_GEN_TOKEN=128
-MAX_GEN_TOKEN=128
+MIN_GEN_TOKENS=128
+MAX_GEN_TOKENS=128
 
 # export DATASET="random"
 # export DATASET=./custom_dataset_qwen3_2000.jsonl
@@ -68,7 +68,7 @@ COMMON_VLLM_ARGS=(
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --no-enable-prefix-caching
     --trust-remote-code
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/qlora_profile"}'
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/"}'
     --port $PORT
     --host $HOST
     #--no-enable-chunked-prefill
@@ -111,10 +111,10 @@ run_server() {
 }
 
 start_profile() {
-	curl -X POST http://0.0.0.0:$PORT/start_profile
+	curl -X POST http://$HOST:$PORT/start_profile
 }
 stop_profile() {
-	curl -X POST http://0.0.0.0:$PORT/stop_profile
+	curl -X POST http://$HOST:$PORT/stop_profile
 }
 
 send_request() {
@@ -127,16 +127,15 @@ send_request() {
 
 profile(){
     local model_name=${1:-$MODEL}
-    local STRING=$2
+    local label=$2
     # rm -r logs/qlora_profile
-    send_request $1 $2
-    send_request $1 $2
-    send_request $1 $2
+    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 run_evalscope $1 
+    rm -rf logs/$2
     start_profile
-    send_request $1 $2
+    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 run_evalscope $1 $2
     stop_profile
     if [ "${TENSOR_PARALLEL_SIZE:-1}" -gt 1 ]; then
-    	python -c 'from torch_npu.profiler.profiler import analyse; analyse("./logs/qlora_profile")'
+    	python -c "from torch_npu.profiler.profiler import analyse; analyse('./logs/$2')"
     fi
 }
 
@@ -145,7 +144,7 @@ run_evalscope() {
     local label=$2
     
     echo "Running Eval: [$label] with model: $model_name"
-    export URL=http://0.0.0.0:${PORT}/v1/chat/completions
+    export URL=http://$HOST:${PORT}/v1/chat/completions
     python3 run_evalscope.py \
         --number "$NUM_PROMPTS" \
         --parallel "$PARALLEL" \
@@ -156,17 +155,43 @@ run_evalscope() {
         --tokenizer-path $MODEL\
         --min-prompt-length $MIN_PROMPT_LENGTH \
         --max-prompt-length $MAX_PROMPT_LENGTH \
-        --min-tokens $MIN_GEN_TOKEN \
-        --max-tokens $MAX_GEN_TOKEN \
+        --min-tokens $MIN_GEN_TOKENS \
+        --max-tokens $MAX_GEN_TOKENS \
+        --url "$URL" \
+        --prefix-length 0 \
+        --extra-args '{"ignore_eos": true}' \
+        --outputs-dir "logs/${label}" \
+        --rate -1 \
+        --tokenizer-path $MODEL \
+	#         --dataset custom \
+	#         --dataset-path "$DATASET" \
+	#         --max-tokens $RANDOM_OUTPUT_LEN \
+	#        --min-tokens $RANDOM_OUTPUT_LEN \
+}
+
+run_mae() {
+    local model_name=$1
+    local label=$2
+
+    echo "Running MAE perf test: [$label] with model: $model_name"
+    export URL=http://$HOST:${PORT}/v1/chat/completions
+    python3 run_mae_perf_tests.py \
+        --number "$NUM_PROMPTS" \
+        --parallel "$PARALLEL" \
+        --model "$model_name" \
+        --api openai \
+        --dataset random \
+        --seed 42 \
+        --tokenizer-path $MODEL \
+        --min-prompt-length $MIN_PROMPT_LENGTH \
+        --max-prompt-length $MAX_PROMPT_LENGTH \
+        --min-tokens $MIN_GEN_TOKENS \
+        --max-tokens $MAX_GEN_TOKENS \
         --url "$URL" \
         --prefix-length 0 \
         --extra-args '{"ignore_eos": true}' \
         --outputs-dir "logs/${label}" \
         --rate -1
-	#         --dataset custom \
-	#         --dataset-path "$DATASET" \
-	#         --max-tokens $RANDOM_OUTPUT_LEN \
-	#        --min-tokens $RANDOM_OUTPUT_LEN \
 }
 
 benchmark() {
