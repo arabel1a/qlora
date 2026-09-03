@@ -537,19 +537,33 @@ static at::Tensor match_rows(const at::Tensor &idx, int64_t rows)
     return idx.slice(0, 0, rows);
 }
 
+static at::Tensor moe_gmm_weight(const at::Tensor &w_in, int64_t lora_id)
+{
+    return w_in.select(0, lora_id).transpose(1, 2).contiguous();
+}
+
+static at::Tensor moe_bgmv_weight(const at::Tensor &w_in)
+{
+    auto s = w_in.sizes();
+    return w_in.reshape({s[0] * s[1], s[2], s[3]});
+}
+
 // use_gmm / no_lora are CPU bool tensors set per step in update_metadata. Read with
 // .item<bool>() (host read on a CPU tensor -> no device sync, aclgraph-safe) so the
 // branch is NOT baked/guarded by torch.compile and needs no recompile per token count.
 void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
                      at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
-                     double scale, at::Tensor use_gmm, at::Tensor no_lora)
+                     double scale, at::Tensor use_gmm, at::Tensor no_lora,
+                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt)
 {
     if (no_lora.item<bool>()) {
         return;
     }
     if (use_gmm.item<bool>()) {  // prefill -> gmm
         for (size_t s = 0; s < lora_a.size(); ++s) {
-            at::Tensor gw = gather_weights_for_gmm(lora_a[s], lora_indices);  // [ng, hidden, rank]
+            at::Tensor gw = is_moe
+                ? moe_gmm_weight(lora_a[s], lora_id.value().item<int64_t>())
+                : gather_weights_for_gmm(lora_a[s], lora_indices);
             at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
             at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);          // [T, rank]
             if (scale != 1.0) {
@@ -560,7 +574,8 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
     } else {                      // decode -> bgmv
         at::Tensor idx = match_rows(token_lora_indices, x.size(0));
         for (size_t s = 0; s < lora_a.size(); ++s) {
-            bgmv_shrink(x, lora_a[s], idx, y[s], scale);
+            at::Tensor aw = is_moe ? moe_bgmv_weight(lora_a[s]) : lora_a[s];
+            bgmv_shrink(x, aw, idx, y[s], scale);
         }
     }
 }
@@ -568,7 +583,8 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
 void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
                      at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                      std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
-                     at::Tensor use_gmm, at::Tensor no_lora)
+                     at::Tensor use_gmm, at::Tensor no_lora,
+                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt)
 {
     if (no_lora.item<bool>()) {
         return;
@@ -577,7 +593,9 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
     if (use_gmm.item<bool>()) {  // prefill -> gmm
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
-            at::Tensor gw = gather_weights_for_gmm(lora_b[s], lora_indices);  // [ng, rank, out]
+            at::Tensor gw = is_moe
+                ? moe_gmm_weight(lora_b[s], lora_id.value().item<int64_t>())
+                : gather_weights_for_gmm(lora_b[s], lora_indices);
             at::Tensor xi = x[s];
             at::Tensor w_in = (gw.scalar_type() == xi.scalar_type()) ? gw : gw.to(xi.scalar_type());
             at::Tensor res = lora_grouped_matmul(xi, w_in, seq_len);          // [T, out]
@@ -593,7 +611,8 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
             at::Tensor idx = match_rows(token_lora_indices, x[s].size(0));
-            bgmv_expand(x[s], lora_b[s], idx, y, offset, size);
+            at::Tensor bw = is_moe ? moe_bgmv_weight(lora_b[s]) : lora_b[s];
+            bgmv_expand(x[s], bw, idx, y, offset, size);
             offset += size;
         }
     }
@@ -2259,13 +2278,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "add_lora_shrink(Tensor(a!)[] y, Tensor x, Tensor[] lora_a, Tensor lora_indices,"
         "                Tensor seq_len, Tensor token_lora_indices, float scale,"
-        "                Tensor use_gmm, Tensor no_lora) -> ()");
+        "                Tensor use_gmm, Tensor no_lora, bool is_moe=False,"
+        "                Tensor? lora_id=None) -> ()");
     ops.impl("add_lora_shrink", torch::kPrivateUse1, &vllm_ascend::add_lora_shrink);
 
     ops.def(
         "add_lora_expand(Tensor(a!) y, Tensor[] x, Tensor[] lora_b, Tensor lora_indices,"
         "                Tensor seq_len, Tensor token_lora_indices, int[] output_slices,"
-        "                int offset_start, bool add_inputs, Tensor use_gmm, Tensor no_lora) -> ()");
+        "                int offset_start, bool add_inputs, Tensor use_gmm, Tensor no_lora,"
+        "                bool is_moe=False, Tensor? lora_id=None) -> ()");
     ops.impl("add_lora_expand", torch::kPrivateUse1, &vllm_ascend::add_lora_expand);
 
     ops.def(

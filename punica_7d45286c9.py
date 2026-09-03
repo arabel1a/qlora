@@ -3,23 +3,17 @@
 from collections.abc import Callable
 import os
 import torch
+import torch_npu
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
+from vllm.logger import logger
 
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-
-# Runtime gate for the gmm path.
-#   off       -> gmm disabled, pure bgmv (committed-safe default)
-#   threshold -> gmm on when token_nums > GMM_TOKEN_THRESHOLD (the prod regime)
-#   force     -> gmm on for every batch (decode too) so it can be tested on short prompts
-GMM_MODE = os.environ.get("LORA_GMM", "off").lower()
-GMM_MULTI_FORCE = os.environ.get("LORA_GMM_MULTI", "off").lower() == "force"
-GMM_TOKEN_THRESHOLD = int(os.environ.get("LORA_GMM_THRESHOLD", "1024"))
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
@@ -63,7 +57,29 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         self._prefill_meta_ready = False
-        
+        self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+        self._moe_lora_id_cpu = torch.tensor(0, dtype=torch.long)
+
+        self.gmm_threshold = (
+            int(os.environ["LORA_GMM_THRESHOLD"])
+            if "LORA_GMM_THRESHOLD" in os.environ
+            else max_batches
+        )
+        from vllm.config import get_current_vllm_config
+
+        max_capture = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        assert max_capture is None or self.gmm_threshold >= max_capture, (
+            f"LORA_GMM_THRESHOLD ({self.gmm_threshold}) must be >= "
+            f"max_cudagraph_capture_size ({max_capture}); otherwise a batch that takes "
+            "the gmm branch could also be cudagraph-captured, baking the host lora_id "
+            "weight address into the replayed graph."
+        )
+        logger.warning(
+            "LoRA gmm kernels enabled for batches with > %d tokens (LORA_GMM_THRESHOLD); "
+            "batches at or below this size use the bgmv path.",
+            self.gmm_threshold,
+        )
+
     def update_metadata(
         self,
         mapping,
@@ -82,12 +98,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         )
 
         token_num = len(mapping.index_mapping)
-        if GMM_MODE == "force":
-            gmm_enabled = True
-        elif GMM_MODE == "threshold":
-            gmm_enabled = token_num > GMM_TOKEN_THRESHOLD
-        else:
-            gmm_enabled = False
+        gmm_enabled = token_num > self.gmm_threshold
 
         if gmm_enabled:
             self._update_prefill_metadata(self.token_lora_indices)
@@ -98,6 +109,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_gmm_expand_cpu.fill_(gmm_enabled)
         self._use_gmm_shrink_cpu.fill_(gmm_enabled)
         self._no_lora_cpu.fill_(self.no_lora)
+
+        int_ids = set(mapping.index_mapping)
+        active_ids = {i for i in int_ids if i > 0}
+        if gmm_enabled and len(active_ids) == 1 and 0 not in int_ids:
+            self._moe_lora_id_cpu.fill_(lora_index_to_id.index(next(iter(active_ids))))
+            self._use_moe_gmm_cpu.fill_(True)
+        else:
+            self._use_moe_gmm_cpu.fill_(False)
+
         self.is_prefill = bool(getattr(mapping, "is_prefill", True))
         self._prefill_meta_ready = gmm_enabled
 
@@ -260,6 +280,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         fully_sharded: bool = False,
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
     ) -> None:
         """
         Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
@@ -302,6 +323,23 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             lora_idx_safe * num_experts + expert_idx,
             torch.full_like(token_lora_mapping, -1),
         ).contiguous()
+        
+        if group_list is not None and not fully_sharded and not mul_routed_weight:
+            buffers = [
+                torch.zeros((x2d.shape[0], b.shape[-1]), dtype=torch.float32, device=x2d.device)
+                for b in lora_b_stacked
+            ]
+            output_slices = [b.shape[-2] for b in lora_b_stacked]
+            torch.ops._C_ascend.add_lora_shrink(
+                buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
+                1.0, self._use_moe_gmm_cpu, self._no_lora_cpu, True, self._moe_lora_id_cpu,
+            )
+            torch.ops._C_ascend.add_lora_expand(
+                y2d, buffers, list(lora_b_stacked), combined_idx, group_list, combined_idx,
+                output_slices, offset, True, self._use_moe_gmm_cpu, self._no_lora_cpu,
+                True, self._moe_lora_id_cpu,
+            )
+            return
 
         cur_offset = offset
         for slice_idx in range(len(lora_a_stacked)):

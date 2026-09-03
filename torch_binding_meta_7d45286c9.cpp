@@ -60,12 +60,14 @@ at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_
 // Fused LoRA apply ops are mutate-only (-> ()): nothing to fake-allocate.
 void add_lora_shrink_meta(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
                           at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
-                          double scale, at::Tensor use_gmm, at::Tensor no_lora) {}
+                          double scale, at::Tensor use_gmm, at::Tensor no_lora,
+                          bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt) {}
 
 void add_lora_expand_meta(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
                           at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                           std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
-                          at::Tensor use_gmm, at::Tensor no_lora) {}
+                          at::Tensor use_gmm, at::Tensor no_lora,
+                          bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt) {}
 
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess(
     const at::Tensor &hiddenState,

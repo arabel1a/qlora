@@ -28,13 +28,11 @@ export MAX_LORA_RANK=16
 
 # benchmarks
 : "${NUM_PROMPTS:=80}"
-: "${RANDOM_INPUT_LEN:=2048}"
-: "${RANDOM_OUTPUT_LEN:=512}"
 : "${PARALLEL:=8}"
 
 WARMUP_PROMPTS_NUM=8
-MIN_PROMPT_LENGTH=2048
-MAX_PROMPT_LENGTH=2048
+MIN_PROMPT_LENGTH=${MIN_PROMPT_LENGTH:-2048}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MIN_GEN_TOKENS=128
 MAX_GEN_TOKENS=128
 
@@ -68,7 +66,7 @@ COMMON_VLLM_ARGS=(
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --no-enable-prefix-caching
     --trust-remote-code
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/"}'
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./logs/profile"}'
     --port $PORT
     --host $HOST
     #--no-enable-chunked-prefill
@@ -86,20 +84,20 @@ LORA_ARGS=(
 
 throughput_bench() {
     vllm bench throughput \
-	--backend vllm \
-	--model "${COMMON_VLLM_ARGS[@]}" \
+        --backend vllm \
+        --model "${COMMON_VLLM_ARGS[@]}" \
         --num-prompts "$NUM_PROMPTS" \
         --dataset-name "$DATASET" \
         --random-input-len "$RANDOM_INPUT_LEN" \
         --random-output-len "$RANDOM_OUTPUT_LEN" \
         --seed 0 \
-	--disable-detokenize \
-	--disable-frontend-multiprocessing \
+        --disable-detokenize \
+        --disable-frontend-multiprocessing \
         --enable-lora \
         --max-loras $MAX_LORAS \
         --max-lora-rank $MAX_LORA_RANK \
         --lora-path ${LORA_ADAPTER} \
-	"$@"
+	      "$@"
 }
 
 run_lora_server() {
@@ -128,25 +126,27 @@ send_request() {
 profile(){
     local model_name=${1:-$MODEL}
     local label=$2
-    # rm -r logs/qlora_profile
-    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 run_evalscope $1 
-    rm -rf logs/$2
+    rm -r logs/profile
+    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 WARMUP=0 run_evalscope $1 $2_es
+    rm -rf logs/$2_es
     start_profile
-    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 run_evalscope $1 $2
+    NUM_PROMPTS=8 PARALLEL=8 MIN_PROMPT_LENGTH=2048 MAX_PROMPT_LENGTH=2048 MIN_GEN_TOKENS=16 MAX_GEN_TOKENS=16 WARMUP=0 run_evalscope $1 $2_es
     stop_profile
     if [ "${TENSOR_PARALLEL_SIZE:-1}" -gt 1 ]; then
-    	python -c "from torch_npu.profiler.profiler import analyse; analyse('./logs/$2')"
+    	python -c "from torch_npu.profiler.profiler import analyse; analyse('./logs/profile')"
     fi
 }
 
 run_evalscope() {
     local model_name=$1
     local label=$2
+    warmup=${WARMUP:-$NUM_PROMPTS}
     
     echo "Running Eval: [$label] with model: $model_name"
     export URL=http://$HOST:${PORT}/v1/chat/completions
     python3 run_evalscope.py \
         --number "$NUM_PROMPTS" \
+        --warmup-num $warmup \
         --parallel "$PARALLEL" \
         --model "$model_name" \
         --api openai \
