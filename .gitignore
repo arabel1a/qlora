@@ -3,3 +3,4 @@ tmp_scripts/
 *.swp
 logs/
 tmp/
+__pycache__

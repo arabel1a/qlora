@@ -103,7 +103,7 @@ def preprocess_lora_indices(
     if split_indices is None:
         return
     expanded = split_indices.repeat_interleave(topk_ids.shape[1])
-    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).long())
+    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).to(torch.float32)).to(torch.long)
     lora_context.permuted_lora_indices = expanded[permutation]
 
 
@@ -125,7 +125,7 @@ def postprocess_lora_indices(
     exchanged = getattr(lora_context, "exchanged_lora_indices", None)
     if exchanged is None:
         return
-    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).long())
+    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).to(torch.float32)).to(torch.long)
     lora_context.exchanged_lora_indices = exchanged[permutation]
 
 
@@ -200,7 +200,8 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     """
     top_k = lora_context.top_k
     expanded = torch.abs(expanded_row_idx)
-    inv_perm = torch.argsort(expanded)
+    inv_perm = torch.argsort(expanded.to(torch.float32)).to(torch.long)
+
     expert_per_row = topk_ids.reshape(-1)[inv_perm].to(torch.long)
 
     # token_lora_indices is a 1D LongTensor sized to max_num_batched_tokens

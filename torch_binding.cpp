@@ -687,9 +687,8 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
             at::Tensor gw = gather_weights_for_gmm(lora_b[s], lora_indices);  // [ng, rank, out]
-            at::Tensor xi = x[s];
-            at::Tensor w_in = (gw.scalar_type() == xi.scalar_type()) ? gw : gw.to(xi.scalar_type());
-            at::Tensor res = lora_grouped_matmul(xi, w_in, seq_len);          // [T, out]
+            at::Tensor xi = (x[s].scalar_type() == gw.scalar_type()) ? x[s] : x[s].to(gw.scalar_type());
+            at::Tensor res = lora_grouped_matmul(xi, gw, seq_len);          // [T, out]
             at::Tensor target = y.slice(1, offset, offset + size);
             if (add_inputs) {
                 target.add_(res.to(target.scalar_type()));

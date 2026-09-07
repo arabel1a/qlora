@@ -362,7 +362,11 @@ class LLMBenchmarker:
         # 1. 基础统计
         total_reqs = len(df)
         success_rate = (len(success_df) / total_reqs) * 100
-        avg_ttft = success_df["TTFT_s"].mean()
+        ttft_values = success_df["TTFT_s"].values
+        avg_ttft = float(np.mean(ttft_values))
+        p50_ttft = float(np.percentile(ttft_values, 50))
+        p90_ttft = float(np.percentile(ttft_values, 90))
+        p99_ttft = float(np.percentile(ttft_values, 99))
         avg_tps = success_df["TPS"].mean()
         avg_input_tokens = success_df["Input_Tokens"].mean()
 
@@ -376,6 +380,9 @@ class LLMBenchmarker:
         print(f"成功率  : {success_rate:.2f}%")
         print(f"平均 TPS: {avg_tps:.2f}")
         print(f"平均 TTFT (首字): {avg_ttft:.4f} s")
+        print(f"中位 TTFT (P50): {p50_ttft:.4f} s")
+        print(f"TTFT P90: {p90_ttft:.4f} s")
+        print(f"TTFT P99: {p99_ttft:.4f} s")
         print(f"平均输入 Token 数: {avg_input_tokens:.0f}")
         print(f"端到端回答时长 (Avg): {e2e_avg:.4f} s")
         print(f"端到端回答时长 (P90): {e2e_p90:.4f} s")
@@ -409,6 +416,9 @@ class LLMBenchmarker:
             ("成功率 (%)", round(success_rate, 2)),
             ("平均 TPS", round(avg_tps, 2)),
             ("平均 TTFT (s)", round(avg_ttft, 4)),
+            ("中位 TTFT P50 (s)", round(p50_ttft, 4)),
+            ("TTFT P90 (s)", round(p90_ttft, 4)),
+            ("TTFT P99 (s)", round(p99_ttft, 4)),
             ("平均输入 Token 数", round(avg_input_tokens, 0)),
             ("端到端回答时长 - Avg (s)", round(e2e_avg, 4)),
             ("端到端回答时长 - P90 (s)", round(e2e_p90, 4)),
