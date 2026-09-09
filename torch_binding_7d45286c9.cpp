@@ -516,15 +516,13 @@ static at::Tensor lora_grouped_matmul(const at::Tensor &x, const at::Tensor &wei
     return out;
 }
 
-// gather per-group LoRA weight ordered by group, transposed for gmm.
-// Mirrors all.py _gather_weights_for_gmm (gather-then-transpose; masked_fill -1).
 static at::Tensor gather_weights_for_gmm(const at::Tensor &w_in, const at::Tensor &lora_indices)
 {
-    at::Tensor w = (w_in.dim() == 4) ? w_in.squeeze(1) : w_in;     // [L, A, B]
+    at::Tensor w = (w_in.dim() == 4) ? w_in.squeeze(1) : w_in;
     at::Tensor safe = lora_indices.clamp_min(0);
-    at::Tensor g = w.index_select(0, safe).transpose(1, 2).contiguous();  // [ng, B, A]
-    at::Tensor inactive = lora_indices.lt(0).unsqueeze(1).unsqueeze(2);
-    return g.masked_fill(inactive, 0);
+    at::Tensor g = w.index_select(0, safe);
+    g.masked_fill_(lora_indices.lt(0).unsqueeze(1).unsqueeze(2), 0);
+    return g.transpose(1, 2);
 }
 
 // bgmv requires indices.size(0) == x.size(0). Under torch.compile/aclgraph the hidden
@@ -539,7 +537,14 @@ static at::Tensor match_rows(const at::Tensor &idx, int64_t rows)
 
 static at::Tensor moe_gmm_weight(const at::Tensor &w_in, int64_t lora_id)
 {
-    return w_in.select(0, lora_id).transpose(1, 2).contiguous();
+    return w_in.select(0, lora_id).transpose(1, 2);
+}
+
+static at::Tensor gmm_weight(const at::Tensor &w_in, bool is_moe, int64_t lora_id,
+                             const at::Tensor &lora_indices)
+{
+    return is_moe ? moe_gmm_weight(w_in, lora_id)
+                  : gather_weights_for_gmm(w_in, lora_indices);
 }
 
 static at::Tensor moe_bgmv_weight(const at::Tensor &w_in)
@@ -548,9 +553,6 @@ static at::Tensor moe_bgmv_weight(const at::Tensor &w_in)
     return w_in.reshape({s[0] * s[1], s[2], s[3]});
 }
 
-// use_gmm / no_lora are CPU bool tensors set per step in update_metadata. Read with
-// .item<bool>() (host read on a CPU tensor -> no device sync, aclgraph-safe) so the
-// branch is NOT baked/guarded by torch.compile and needs no recompile per token count.
 void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
                      at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                      double scale, at::Tensor use_gmm, at::Tensor no_lora,
@@ -560,16 +562,41 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
         return;
     }
     if (use_gmm.item<bool>()) {  // prefill -> gmm
-        for (size_t s = 0; s < lora_a.size(); ++s) {
-            at::Tensor gw = is_moe
-                ? moe_gmm_weight(lora_a[s], lora_id.value().item<int64_t>())
-                : gather_weights_for_gmm(lora_a[s], lora_indices);
+        const size_t n_slices = lora_a.size();
+        const int64_t id = is_moe ? lora_id.value().item<int64_t>() : 0;
+
+        std::vector<at::Tensor> gws;
+        gws.reserve(n_slices);
+        for (size_t s = 0; s < n_slices; ++s) {
+            gws.push_back(gmm_weight(lora_a[s], is_moe, id, lora_indices));
+        }
+
+        for (size_t s = 0; s < n_slices; ++s) {
+            TORCH_CHECK(gws[s].size(2) == gws[0].size(2) && y[s].size(1) == gws[0].size(2),
+                        "add_lora_shrink: all slices must share the same rank");
+        }
+
+        if (n_slices <= 1) {
+            for (size_t s = 0; s < n_slices; ++s) {
+                at::Tensor gw = gws[s].contiguous();
+                at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
+                at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);      // [T, rank]
+                if (scale != 1.0) {
+                    res = res.mul(scale);
+                }
+                y[s].add_(res.to(y[s].scalar_type()));
+            }
+        } else {
+            at::Tensor gw = at::cat(gws, 2);
             at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
-            at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);          // [T, rank]
+            at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);          // [T, n_slices*rank]
             if (scale != 1.0) {
                 res = res.mul(scale);
             }
-            y[s].add_(res.to(y[s].scalar_type()));
+            const int64_t rank = gws[0].size(2);
+            for (size_t s = 0; s < n_slices; ++s) {
+                y[s].add_(res.slice(1, s * rank, (s + 1) * rank).to(y[s].scalar_type()));
+            }
         }
     } else {                      // decode -> bgmv
         at::Tensor idx = match_rows(token_lora_indices, x.size(0));
@@ -593,9 +620,9 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
     if (use_gmm.item<bool>()) {  // prefill -> gmm
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
-            at::Tensor gw = is_moe
-                ? moe_gmm_weight(lora_b[s], lora_id.value().item<int64_t>())
-                : gather_weights_for_gmm(lora_b[s], lora_indices);
+            at::Tensor gw = gmm_weight(lora_b[s], is_moe,
+                                       is_moe ? lora_id.value().item<int64_t>() : 0,
+                                       lora_indices).contiguous();
             at::Tensor xi = (x[s].scalar_type() == gw.scalar_type()) ? x[s] : x[s].to(gw.scalar_type());
             at::Tensor res = lora_grouped_matmul(xi, gw, seq_len);          // [T, out]
             at::Tensor target = y.slice(1, offset, offset + size);
