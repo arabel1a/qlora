@@ -533,6 +533,7 @@ def unquant_apply_mlp(
             hidden_states=hidden_states,
             lora_routing=lora_routing,
             group_list=group_list,
+            group_list_type=group_list_type,
         )
 
     act_name = getattr(activation, "value", activation)
@@ -584,6 +585,7 @@ def unquant_apply_mlp(
             silu_out=gate_up_out,
             lora_routing=lora_routing,
             group_list=group_list,
+            group_list_type=group_list_type,
         )
     return hidden_states, None
 

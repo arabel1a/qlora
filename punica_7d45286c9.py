@@ -281,6 +281,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
         group_list: torch.Tensor | None = None,
+        group_list_type: int = 1,
     ) -> None:
         """
         Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
@@ -333,11 +334,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             torch.ops._C_ascend.add_lora_shrink(
                 buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
                 1.0, self._use_moe_gmm_cpu, self._no_lora_cpu, True, self._moe_lora_id_cpu,
+                group_list_type,
             )
             torch.ops._C_ascend.add_lora_expand(
                 y2d, buffers, list(lora_b_stacked), combined_idx, group_list, combined_idx,
                 output_slices, offset, True, self._use_moe_gmm_cpu, self._no_lora_cpu,
-                True, self._moe_lora_id_cpu,
+                True, self._moe_lora_id_cpu, group_list_type,
             )
             return
 

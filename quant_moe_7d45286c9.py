@@ -228,6 +228,7 @@ def _apply_dynamic_int8_moe_lora(
         hidden_states=hidden_states,
         lora_routing=lora_routing,
         group_list=mlp_compute_input.group_list,
+        group_list_type=mlp_compute_input.group_list_type,
     )
 
     activated = _apply_moe_activation(
@@ -271,6 +272,7 @@ def _apply_dynamic_int8_moe_lora(
         silu_out=activated,
         lora_routing=lora_routing,
         group_list=mlp_compute_input.group_list,
+        group_list_type=mlp_compute_input.group_list_type,
     )
     return down_out, before_gmm2_evt
 

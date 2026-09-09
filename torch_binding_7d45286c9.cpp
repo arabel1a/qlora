@@ -491,24 +491,23 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
 
 // ---------------------------------------------------------------------------
 // Fused LoRA apply: one opaque op per add_shrink/add_expand that branches on token_num. 
-// prefill (token_num > threshold) -> gmm (aclnnGroupedMatmulV4);
-// decode -> bgmv (per-token in-kernel weight indexing, no gather/metadata).
+// prefill (token_num > threshold) -> gmm (aclnnGroupedMatmulV4); decode -> bgmv
 // ---------------------------------------------------------------------------
 
-// grouped matmul mirroring npu_grouped_matmul(split_item=2, group_type=0,
-// group_list_type=1): x[T,K] @ weight[ng,K,N] grouped by group_list -> [T,N].
-// Output preallocated and passed as the aclnn result. Validated bit-exact vs
-// npu_grouped_matmul (JIT 2026-06-17).
 static at::Tensor lora_grouped_matmul(const at::Tensor &x, const at::Tensor &weight,
-                                      const at::Tensor &group_list)
+                                      const at::Tensor &group_list,
+                                      int64_t group_list_type = 1)
 {
+    TORCH_CHECK(group_list_type == 1,
+                "lora_grouped_matmul: only group_list_type=1 (per-expert counts) is "
+                "implemented, got ", group_list_type);
     int64_t T = x.size(0);
     int64_t N = weight.size(weight.dim() - 1);
     at::Tensor out = at::empty({T, N}, x.options());
     std::vector<at::Tensor> xv{x}, wv{weight}, ov{out};
     at::TensorList xs(xv), ws(wv), result(ov);
     at::TensorList none, act_out, dyn;
-    int64_t split_item = 2, group_type = 0, group_list_type = 1, act_type = 0;
+    int64_t split_item = 2, group_type = 0, act_type = 0;
     EXEC_NPU_CMD(aclnnGroupedMatmulV4, xs, ws, none, none, none, none,
                  none, none, group_list, none,
                  none, none, split_item, group_type,
@@ -556,7 +555,8 @@ static at::Tensor moe_bgmv_weight(const at::Tensor &w_in)
 void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
                      at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                      double scale, at::Tensor use_gmm, at::Tensor no_lora,
-                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt)
+                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt,
+                     int64_t group_list_type = 1)
 {
     if (no_lora.item<bool>()) {
         return;
@@ -580,7 +580,7 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
             for (size_t s = 0; s < n_slices; ++s) {
                 at::Tensor gw = gws[s].contiguous();
                 at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
-                at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);      // [T, rank]
+                at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len, group_list_type);  // [T, rank]
                 if (scale != 1.0) {
                     res = res.mul(scale);
                 }
@@ -589,7 +589,7 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
         } else {
             at::Tensor gw = at::cat(gws, 2);
             at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
-            at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);          // [T, n_slices*rank]
+            at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len, group_list_type);  // [T, n_slices*rank]
             if (scale != 1.0) {
                 res = res.mul(scale);
             }
@@ -611,7 +611,8 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
                      at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                      std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
                      at::Tensor use_gmm, at::Tensor no_lora,
-                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt)
+                     bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt,
+                     int64_t group_list_type = 1)
 {
     if (no_lora.item<bool>()) {
         return;
@@ -624,7 +625,7 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
                                        is_moe ? lora_id.value().item<int64_t>() : 0,
                                        lora_indices).contiguous();
             at::Tensor xi = (x[s].scalar_type() == gw.scalar_type()) ? x[s] : x[s].to(gw.scalar_type());
-            at::Tensor res = lora_grouped_matmul(xi, gw, seq_len);          // [T, out]
+            at::Tensor res = lora_grouped_matmul(xi, gw, seq_len, group_list_type);  // [T, out]
             at::Tensor target = y.slice(1, offset, offset + size);
             if (add_inputs) {
                 target.add_(res.to(target.scalar_type()));
@@ -2305,14 +2306,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "add_lora_shrink(Tensor(a!)[] y, Tensor x, Tensor[] lora_a, Tensor lora_indices,"
         "                Tensor seq_len, Tensor token_lora_indices, float scale,"
         "                Tensor use_gmm, Tensor no_lora, bool is_moe=False,"
-        "                Tensor? lora_id=None) -> ()");
+        "                Tensor? lora_id=None, int group_list_type=1) -> ()");
     ops.impl("add_lora_shrink", torch::kPrivateUse1, &vllm_ascend::add_lora_shrink);
 
     ops.def(
         "add_lora_expand(Tensor(a!) y, Tensor[] x, Tensor[] lora_b, Tensor lora_indices,"
         "                Tensor seq_len, Tensor token_lora_indices, int[] output_slices,"
         "                int offset_start, bool add_inputs, Tensor use_gmm, Tensor no_lora,"
-        "                bool is_moe=False, Tensor? lora_id=None) -> ()");
+        "                bool is_moe=False, Tensor? lora_id=None, int group_list_type=1) -> ()");
     ops.impl("add_lora_expand", torch::kPrivateUse1, &vllm_ascend::add_lora_expand);
 
     ops.def(
