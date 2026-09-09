@@ -61,15 +61,13 @@ at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_
 void add_lora_shrink_meta(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
                           at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                           double scale, at::Tensor use_gmm, at::Tensor no_lora,
-                          bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt,
-                          int64_t group_list_type = 1) {}
+                          bool is_moe = false, int64_t group_list_type = 1) {}
 
 void add_lora_expand_meta(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
                           at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
                           std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
                           at::Tensor use_gmm, at::Tensor no_lora,
-                          bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt,
-                          int64_t group_list_type = 1) {}
+                          bool is_moe = false, int64_t group_list_type = 1) {}
 
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess(
     const at::Tensor &hiddenState,
